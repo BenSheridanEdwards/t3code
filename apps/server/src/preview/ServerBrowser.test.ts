@@ -34,6 +34,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as Broker from "../mcp/PreviewAutomationBroker.ts";
 import * as DesktopChannel from "./DesktopBrowserChannel.ts";
 import * as Manager from "./Manager.ts";
+import * as PreviewAgentActivity from "./PreviewAgentActivity.ts";
 import * as ServerBrowser from "./ServerBrowser.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
 
@@ -302,6 +303,7 @@ const asSession = (providerSessionId: string) => ({
 const dependencies = Layer.mergeAll(
   Broker.layer,
   Manager.layer,
+  PreviewAgentActivity.layer,
   Layer.succeed(ServerEnvironment.ServerEnvironment, {
     getEnvironmentId: Effect.succeed(scope.environmentId),
     getDescriptor: Effect.die("unused descriptor"),
@@ -766,6 +768,54 @@ it.live("a desktop tab is held focused only by agent operations and viewers", ()
       expect(desktopFocus).toEqual(["focus:true"]);
       yield* Scope.close(viewerScope, Exit.void);
       expect(desktopFocus).toEqual(["focus:true", "focus:false"]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+// Blurring between tools fires real blur events, which close the dropdown a typed field opened.
+it.live("an agent's tab stays focused across its execution's tool calls", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const activity = yield* PreviewAgentActivity.PreviewAgentActivity;
+      yield* Effect.yieldNow;
+      desktopRendersNext = true;
+      const endFirst = yield* activity.begin(scope.thread.threadId);
+      const opened = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { reuseExistingTab: false, show: false },
+      });
+      const tabId = PreviewTabId.make(opened.tabId!);
+      const page = desktopConnections[0]!.context.page;
+      page.locator.mockReturnValue({ evaluate: async () => {} } as never);
+      const act = (operation: "type" | "click") =>
+        broker.invoke({
+          scope,
+          tabId,
+          operation,
+          input: operation === "type" ? { locator: "input", text: "hi" } : { locator: "li" },
+        });
+      const releasedFocus = () => {
+        const released = Promise.withResolvers<void>();
+        onDesktopFocus = (hold) => {
+          if (!hold) released.resolve();
+        };
+        return released.promise;
+      };
+      yield* act("type").pipe(Effect.exit);
+      yield* act("click").pipe(Effect.exit);
+      expect(desktopFocus).toEqual(["focus:true"]);
+      // A later execution overlaps; the first one ending does not end its hold.
+      const endSecond = yield* activity.begin(scope.thread.threadId);
+      yield* endFirst;
+      yield* act("click").pipe(Effect.exit);
+      expect(desktopFocus).toEqual(["focus:true"]);
+      const released = releasedFocus();
+      yield* endSecond;
+      yield* Effect.promise(() => released);
+      expect(desktopFocus).toEqual(["focus:true", "focus:false"]);
+      expect(new Set(desktopFocusHolders).size).toBe(1);
     }),
   ).pipe(Effect.provide(layer)),
 );

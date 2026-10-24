@@ -77,6 +77,7 @@ import { resolveRootCliCommand } from "../cli/invocation.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
 import * as DesktopBrowserChannel from "./DesktopBrowserChannel.ts";
+import * as PreviewAgentActivity from "./PreviewAgentActivity.ts";
 import * as PreviewManager from "./Manager.ts";
 import * as ServerBrowserPage from "./ServerBrowserPage.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
@@ -274,6 +275,11 @@ interface Recording {
   readonly releaseFocus: () => Promise<void>;
 }
 
+interface AgentFocusHold {
+  readonly ended: Effect.Effect<void>;
+  readonly release: () => Promise<void>;
+}
+
 interface ServerTab {
   readonly threadId: ThreadId;
   readonly tabId: string;
@@ -288,6 +294,7 @@ interface ServerTab {
   readonly actionTimeline: Array<PreviewAutomationActionEvent>;
   readonly control: SessionControl;
   agentOperating: boolean;
+  agentFocus: AgentFocusHold | null;
   fileChooserIntercepted: boolean;
   readonly onFileChooser: (chooser: FileChooser) => void;
 
@@ -464,6 +471,7 @@ const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
   const desktopChannel = yield* DesktopBrowserChannel.DesktopBrowserChannel;
+  const agentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const launchServices = yield* Effect.context<ChildProcessSpawner.ChildProcessSpawner>();
   const setupCommand = yield* resolveRootCliCommand(PreviewBrowserHost.SETUP_SUBCOMMAND);
@@ -678,6 +686,7 @@ const make = Effect.gen(function* () {
     if (tab.isolatedContext) void tab.page.context().close().catch(constVoid);
     void tab.recording?.encoder.close().catch(constVoid);
     void tab.recording?.releaseFocus();
+    releaseAgentFocus(tab);
     void NodeFSP.rm(downloadDir(tab), { recursive: true, force: true }).catch(constVoid);
     reportLiveTabs();
     if (closeSession) {
@@ -764,6 +773,7 @@ const make = Effect.gen(function* () {
       actionTimeline: [],
       control,
       agentOperating: false,
+      agentFocus: null,
       fileChooserIntercepted: false,
       onFileChooser: (chooser) => void offerFileChooser(tab, chooser),
       isolatedContext,
@@ -1644,6 +1654,36 @@ const make = Effect.gen(function* () {
     return () => Effect.runPromise(desktopChannel.focus(tab, holder, false));
   };
 
+  /**
+   * Blurring between tool calls fires real blur and focus events, which closes the
+   * dropdown a typed field just opened. So an agent's tab stays focused until its
+   * execution ends, and only an operation from outside any execution, such as an
+   * external MCP client, holds focus for itself. Returns that operation's release.
+   */
+  const holdAgentFocus = async (tab: ServerTab): Promise<(() => Promise<void>) | null> => {
+    if (tab.desktop === null) return null;
+    const ended = Option.getOrNull(await Effect.runPromise(agentActivity.running(tab.threadId)));
+    if (ended === null) return holdDesktopFocus(tab);
+    const previous = tab.agentFocus;
+    if (previous?.ended === ended) return null;
+    const hold = { ended, release: await holdDesktopFocus(tab) };
+    if (tab.closing) {
+      await hold.release();
+      return null;
+    }
+    tab.agentFocus = hold;
+    // Taken over before release, so the tab never blurs between executions.
+    if (previous) void previous.release().catch(constVoid);
+    void Effect.runPromise(ended).then(() => releaseAgentFocus(tab, hold));
+    return null;
+  };
+
+  const releaseAgentFocus = (tab: ServerTab, hold = tab.agentFocus) => {
+    if (hold === null || tab.agentFocus !== hold) return;
+    tab.agentFocus = null;
+    void hold.release().catch(constVoid);
+  };
+
   let pointerSequence = 0;
   const pointerFor =
     (tab: ServerTab): ServerBrowserPage.PointerReporter =>
@@ -1842,7 +1882,7 @@ const make = Effect.gen(function* () {
                 "dialogPending",
               );
             // Loads like a navigate operation, so a field it autofocuses gets its events.
-            const releaseFocus = await holdDesktopFocus(tab);
+            const releaseFocus = await holdAgentFocus(tab);
             try {
               if (existing) {
                 if (url) await navigate(tab, url, "load", navigationTimeout);
@@ -1866,7 +1906,7 @@ const make = Effect.gen(function* () {
               }
               return statusWithTitle(tab, request.agentSessionId);
             } finally {
-              await releaseFocus();
+              await releaseFocus?.();
             }
           },
           deadlineMs,
@@ -1959,7 +1999,7 @@ const make = Effect.gen(function* () {
         updateFileChooserInterception(tab);
         let releaseFocus: (() => Promise<void>) | null = null;
         try {
-          if (tab.agentOperating) releaseFocus = await holdDesktopFocus(tab);
+          if (tab.agentOperating) releaseFocus = await holdAgentFocus(tab);
           return await executeTabOperation(tab, request);
         } finally {
           await releaseFocus?.();
@@ -2472,6 +2512,7 @@ const make = Effect.gen(function* () {
           if (!message) return;
           try {
             if (message.type === "takeControl") {
+              releaseAgentFocus(tab);
               const taking = tab.control.take(viewer.id);
               broadcastControl(tab);
               await taking;
