@@ -271,6 +271,7 @@ interface Recording {
   readonly session: CDPSession;
   readonly startedAt: string;
   readonly framesInFlight: Set<Promise<void>>;
+  readonly releaseFocus: () => Promise<void>;
 }
 
 interface ServerTab {
@@ -676,6 +677,7 @@ const make = Effect.gen(function* () {
     else void tab.page.close().catch(constVoid);
     if (tab.isolatedContext) void tab.page.context().close().catch(constVoid);
     void tab.recording?.encoder.close().catch(constVoid);
+    void tab.recording?.releaseFocus();
     void NodeFSP.rm(downloadDir(tab), { recursive: true, force: true }).catch(constVoid);
     reportLiveTabs();
     if (closeSession) {
@@ -1476,6 +1478,8 @@ const make = Effect.gen(function* () {
       if (tab.recording) return tab.recording;
       const encoder = await contexts.scratchPage();
       let session: CDPSession | null = null;
+      // A hidden guest paints no screencast frames unless it behaves as focused.
+      const releaseFocus = await holdDesktopFocus(tab);
       try {
         await encoder.evaluate(ServerBrowserPage.recordingEncoderScript(recordingFrameRate));
         // Seed idle pages before returning so an immediate stop has a frame to encode.
@@ -1519,12 +1523,14 @@ const make = Effect.gen(function* () {
           session: opened,
           startedAt: new Date().toISOString(),
           framesInFlight,
+          releaseFocus,
         };
         tab.recording = recording;
         return recording;
       } catch (cause) {
         await encoder.close().catch(constVoid);
         await session?.detach().catch(constVoid);
+        await releaseFocus();
         throw cause;
       }
     }).finally(() => {
@@ -1592,6 +1598,7 @@ const make = Effect.gen(function* () {
         }
       } finally {
         await recording.encoder.close().catch(constVoid);
+        await recording.releaseFocus();
         tab.recording = null;
       }
       const data = Buffer.concat(chunks);
@@ -1617,6 +1624,18 @@ const make = Effect.gen(function* () {
         uploadedAttachmentId: pendingId,
       };
     });
+
+  /**
+   * A desktop guest behaves as focused only while held, so a preview the panel hid
+   * still throttles. Holders release in a finally or finalizer, so errors and
+   * cancellation end the hold too.
+   */
+  const holdDesktopFocus = async (tab: ServerTab): Promise<() => Promise<void>> => {
+    if (tab.desktop === null) return async () => {};
+    const holder = NodeCrypto.randomUUID();
+    await Effect.runPromise(desktopChannel.focus(tab, holder, true));
+    return () => Effect.runPromise(desktopChannel.focus(tab, holder, false));
+  };
 
   let pointerSequence = 0;
   const pointerFor =
@@ -1815,27 +1834,33 @@ const make = Effect.gen(function* () {
                 "A browser dialog is pending. Read preview_status and use preview_dialog first.",
                 "dialogPending",
               );
-            if (existing) {
-              if (url) await navigate(tab, url, "load", navigationTimeout);
-            } else {
-              await tab.initialNavigation;
+            // Loads like a navigate operation, so a field it autofocuses gets its events.
+            const releaseFocus = await holdDesktopFocus(tab);
+            try {
+              if (existing) {
+                if (url) await navigate(tab, url, "load", navigationTimeout);
+              } else {
+                await tab.initialNavigation;
+              }
+              const reveal = open.open ?? open.show;
+              if (reveal !== false) {
+                await Effect.runPromise(
+                  manager.requestReveal({
+                    threadId: tab.threadId,
+                    tabId: tab.tabId,
+                    force: reveal === true,
+                  }),
+                );
+              }
+              if (!existing && url) {
+                await tab.page
+                  .waitForLoadState("load", { timeout: navigationTimeout })
+                  .catch(constVoid);
+              }
+              return statusWithTitle(tab, request.agentSessionId);
+            } finally {
+              await releaseFocus();
             }
-            const reveal = open.open ?? open.show;
-            if (reveal !== false) {
-              await Effect.runPromise(
-                manager.requestReveal({
-                  threadId: tab.threadId,
-                  tabId: tab.tabId,
-                  force: reveal === true,
-                }),
-              );
-            }
-            if (!existing && url) {
-              await tab.page
-                .waitForLoadState("load", { timeout: navigationTimeout })
-                .catch(constVoid);
-            }
-            return statusWithTitle(tab, request.agentSessionId);
           },
           deadlineMs,
         );
@@ -1925,9 +1950,12 @@ const make = Effect.gen(function* () {
         const generation = tab.control.generation;
         tab.agentOperating = !READ_OPERATIONS.has(request.operation);
         updateFileChooserInterception(tab);
+        let releaseFocus: (() => Promise<void>) | null = null;
         try {
+          if (tab.agentOperating) releaseFocus = await holdDesktopFocus(tab);
           return await executeTabOperation(tab, request);
         } finally {
+          await releaseFocus?.();
           tab.agentOperating = false;
           updateFileChooserInterception(tab);
           if (generation !== tab.control.generation) ServerBrowserPage.invalidateRefs(tab.page);
@@ -2256,6 +2284,11 @@ const make = Effect.gen(function* () {
     "ServerBrowser.attachViewer",
   )(function* (input) {
     const tab = yield* findTab(input.threadId, input.tabId);
+    // A hidden guest paints no screencast frames or stills unless it behaves as focused.
+    yield* Effect.acquireRelease(
+      Effect.promise(() => holdDesktopFocus(tab)),
+      (release) => Effect.promise(release),
+    );
     const output = yield* Queue.make<ServerBrowserViewerOutput>({
       capacity: VIEWER_OUTPUT_LIMIT,
       strategy: "dropping",

@@ -278,6 +278,8 @@ const desktopRenders = (tabId: string) => {
   return desktopTabs.has(tabId);
 };
 const releasedDesktopTabs: Array<string> = [];
+const desktopFocus: Array<string> = [];
+const desktopFocusHolders: Array<string> = [];
 const desktopConnections: Array<{ endpoint: string; context: ReturnType<typeof makeContext> }> = [];
 const testThread = {
   threadId: ThreadId.make("browser-test-thread"),
@@ -338,6 +340,11 @@ const dependencies = Layer.mergeAll(
         Effect.sync(() => releasedDesktopTabs.push(key.tabId)),
       ),
     pointer: () => Effect.void,
+    focus: (_key, holder, hold) =>
+      Effect.sync(() => {
+        desktopFocusHolders.push(holder);
+        desktopFocus.push(`focus:${hold}`);
+      }),
   }),
 ).pipe(
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-server-browser-" })),
@@ -378,6 +385,8 @@ beforeEach(() => {
   desktopTabs.clear();
   desktopRendersNext = false;
   releasedDesktopTabs.length = 0;
+  desktopFocus.length = 0;
+  desktopFocusHolders.length = 0;
   desktopConnections.length = 0;
 });
 
@@ -721,7 +730,43 @@ it.live("a closing viewer cannot restart its screencast after the final stop", (
 );
 
 // Focus emulation keeps a hidden guest unthrottled, so a desktop tab gets it only
-// for the length of an agent operation, including one the page makes fail.
+// while an agent operation runs, including one the page makes fail, or a viewer watches.
+it.live("a desktop tab is held focused only by agent operations and viewers", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      const browser = yield* ServerBrowser.ServerBrowser;
+      yield* Effect.yieldNow;
+      desktopRendersNext = true;
+      const opened = yield* manager.open({ threadId: scope.thread.threadId, runtime: "server" });
+      const tabId = PreviewTabId.make(opened.tabId);
+      yield* broker.invoke({ scope, tabId, operation: "status", input: {} });
+      const page = desktopConnections[0]!.context.page;
+      page.locator.mockReturnValue({
+        evaluate: async () => {
+          desktopFocus.push("evaluate");
+          throw new Error("The page threw.");
+        },
+      } as never);
+
+      yield* broker
+        .invoke<void>({ scope, tabId, operation: "type", input: { locator: "input", text: "hi" } })
+        .pipe(Effect.flip);
+      yield* broker.invoke({ scope, tabId, operation: "status", input: {} });
+      expect(desktopFocus).toEqual(["focus:true", "evaluate", "focus:false"]);
+      expect(new Set(desktopFocusHolders).size).toBe(1);
+
+      desktopFocus.length = 0;
+      const viewerScope = yield* Scope.make();
+      yield* browser.attachViewer(viewerInput(tabId, false)).pipe(Scope.provide(viewerScope));
+      expect(desktopFocus).toEqual(["focus:true"]);
+      yield* Scope.close(viewerScope, Exit.void);
+      expect(desktopFocus).toEqual(["focus:true", "focus:false"]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 it.live("reports a pending dialog without evaluating the page and resolves it explicitly", () =>
   Effect.scoped(
     Effect.gen(function* () {

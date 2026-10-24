@@ -25,5 +25,15 @@ export const DesktopBrowserCommand = Schema.Union([
     x: Schema.Finite,
     y: Schema.Finite,
   }),
+  /**
+   * The guest behaves as focused while any holder (an agent operation or a viewer)
+   * holds it. Named holders keep a dropped tab's late release from ending a live hold.
+   */
+  Schema.Struct({
+    type: Schema.Literal("focus"),
+    ...TabKey,
+    holder: TrimmedNonEmptyString,
+    hold: Schema.Boolean,
+  }),
 ]);
 export type DesktopBrowserCommand = typeof DesktopBrowserCommand.Type;

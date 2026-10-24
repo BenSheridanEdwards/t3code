@@ -48,6 +48,8 @@ interface AttachedTab {
   downloadDirectory: string | null;
   pendingDownloadGuid: string | null;
   agentInputAt: number;
+  readonly focusHolders: Set<string>;
+  focusPending: Promise<void> | null;
   readonly onMessage: (
     event: Electron.Event,
     method: string,
@@ -122,13 +124,45 @@ export const make = Effect.gen(function* () {
       else tab.waitingScreenshots.push(start);
     });
 
+  /**
+   * Chromium counts a focus-emulated page as captured, so a hidden guest would never
+   * throttle. Without it, focus() in a guest whose window lacks focus moves the active
+   * element but fires no focus events, and a hidden guest paints no screencast frames.
+   * The relay drops Playwright's connection-wide request; the server holds focus for
+   * each agent operation and viewer instead.
+   */
+  const holdFocus = (tab: AttachedTab, holder: string, hold: boolean) => {
+    const was = tab.focusHolders.size > 0;
+    if (hold) tab.focusHolders.add(holder);
+    else tab.focusHolders.delete(holder);
+    const enabled = tab.focusHolders.size > 0;
+    if (enabled === was) return;
+    // A guest that refuses it, or a debugger already gone, behaves as unfocused.
+    const pending: Promise<void> = tab.debuggee.debugger
+      .sendCommand("Emulation.setFocusEmulationEnabled", { enabled })
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .finally(() => {
+        if (tab.focusPending === pending) tab.focusPending = null;
+      });
+    tab.focusPending = pending;
+  };
+
   const relayFor = (tab: AttachedTab) => {
     if (tab.relay) return tab.relay;
     const { webContents, debugger: debuggee } = tab.debuggee;
-    const send = (method: string, params: Record<string, unknown>, sessionId?: string) =>
+    const sendNow = (method: string, params: Record<string, unknown>, sessionId?: string) =>
       sessionId === undefined
         ? sendPageCommand(webContents, debuggee, method, params)
         : debuggee.sendCommand(method, params, sessionId);
+    // Commands wait for a focus change the server sent ahead of them; insertText and
+    // other non-CDP input would not queue behind it on their own.
+    const send = (method: string, params: Record<string, unknown>, sessionId?: string) =>
+      tab.focusPending === null
+        ? sendNow(method, params, sessionId)
+        : tab.focusPending.then(() => sendNow(method, params, sessionId));
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
         send: (method, params, sessionId) =>
@@ -194,6 +228,8 @@ export const make = Effect.gen(function* () {
       downloadDirectory: null,
       pendingDownloadGuid: null,
       agentInputAt: Number.NEGATIVE_INFINITY,
+      focusHolders: new Set(),
+      focusPending: null,
       onMessage: (_event, method, params, sessionId) => {
         if (method === "Browser.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;
@@ -224,6 +260,11 @@ export const make = Effect.gen(function* () {
         runFork(PubSub.publish(pointers, { key: { threadId, tabId }, phase, x, y }));
         return;
       }
+      if (command.value.type === "focus") {
+        holdFocus(tab, command.value.holder, command.value.hold);
+        return;
+      }
+      // A replacement connection may already hold focus; each holder releases its own.
       if (command.value.type === "release") {
         tab.relay = null;
         return;
@@ -242,6 +283,8 @@ export const make = Effect.gen(function* () {
       [...tabs.values()],
       (tab) => {
         tab.relay = null;
+        // A new backend: the old one's holders are gone without releasing.
+        for (const holder of tab.focusHolders) holdFocus(tab, holder, false);
         return PubSub.publish(outbox, { type: "attached", ...tab.key });
       },
       { discard: true },

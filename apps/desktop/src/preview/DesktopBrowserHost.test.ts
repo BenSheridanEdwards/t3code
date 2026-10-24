@@ -248,4 +248,42 @@ describe("DesktopBrowserHost", () => {
       expect(host.humanStartedDownload(debuggee.tab.webContents)).toBe(false);
     }),
   );
+
+  // Focus emulation counts a guest as captured, so a hidden preview would never
+  // throttle; without it an unfocused guest's focus() fires no focus events.
+  it.effect("emulates focus while any server holder holds it", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      const calls: Array<string> = [];
+      const toggled: Array<() => void> = [];
+      debuggee.tab.debugger.sendCommand = ((method: string, params?: { enabled?: boolean }) => {
+        if (method !== "Emulation.setFocusEmulationEnabled") {
+          calls.push(method);
+          return Promise.resolve({});
+        }
+        calls.push(`focus:${params?.enabled}`);
+        // A guest that refuses the change still lets the commands behind it run.
+        return new Promise((_resolve, reject) => toggled.push(() => reject(new Error("gone"))));
+      }) as Electron.Debugger["sendCommand"];
+      host.attach(key, debuggee.tab);
+      const focus = (holder: string, hold: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "focus", ...key, holder, hold }));
+
+      yield* focus("operation", true);
+      yield* command(host, 1, "Runtime.evaluate");
+      yield* focus("viewer", true);
+      yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
+      yield* focus("operation", false);
+      yield* focus("operation", false);
+      expect(calls).toEqual(["focus:true"]);
+
+      toggled.shift()!();
+      // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary, not a wait for time
+      yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
+      expect(calls).toEqual(["focus:true", "Runtime.evaluate"]);
+      yield* focus("viewer", false);
+      expect(calls).toEqual(["focus:true", "Runtime.evaluate", "focus:false"]);
+    }),
+  );
 });

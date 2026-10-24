@@ -57,6 +57,11 @@ export class DesktopBrowserChannel extends Context.Service<
       key: DesktopTabKey,
       pointer: { readonly phase: "move" | "click"; readonly x: number; readonly y: number },
     ) => Effect.Effect<void>;
+    /**
+     * The guest behaves as focused only while something holds it, so a preview the
+     * panel hid still throttles. Never fails: an undelivered hold acts unfocused.
+     */
+    readonly focus: (key: DesktopTabKey, holder: string, hold: boolean) => Effect.Effect<void>;
   }
 >()("t3/preview/DesktopBrowserChannel") {}
 
@@ -78,6 +83,7 @@ const make = Effect.gen(function* () {
       isAttached: () => Effect.succeed(false),
       endpoint: () => Effect.die("No desktop app is attached to this server."),
       pointer: () => Effect.void,
+      focus: () => Effect.void,
     });
   }
 
@@ -216,6 +222,7 @@ const make = Effect.gen(function* () {
     isAttached: (key) => Effect.sync(() => attachedTabs.has(keyOf(key))),
     endpoint,
     pointer: (key, pointer) => command({ type: "pointer", ...key, ...pointer }),
+    focus: (key, holder, hold) => command({ type: "focus", ...key, holder, hold }),
   });
 });
 
