@@ -238,6 +238,27 @@ describe("server browser element refs", () => {
     },
   );
 
+  it("types without a locator into the active field, inside shadow roots too", async () => {
+    await page.setContent(`
+      <input aria-label="light">
+      <div id="host"></div>
+      <script>
+        host.attachShadow({ mode: "open" }).innerHTML = "<input aria-label=shadow>";
+      </script>`);
+    await page.getByRole("textbox", { name: "light" }).focus();
+    await ServerBrowserPage.type(page, { text: "light text" });
+    expect(await page.getByRole("textbox", { name: "light" }).inputValue()).toBe("light text");
+
+    await page.getByRole("textbox", { name: "shadow" }).focus();
+    await ServerBrowserPage.type(page, { text: "shadow text" });
+    expect(await page.getByRole("textbox", { name: "shadow" }).inputValue()).toBe("shadow text");
+
+    await page.getByRole("textbox", { name: "shadow" }).blur();
+    await expect(ServerBrowserPage.type(page, { text: "lost" })).rejects.toThrow(
+      "not an enabled text field",
+    );
+  });
+
   it("preserves quoted attribute values containing ref engine text", async () => {
     await page.setContent(
       '<button data-example=" >> aria-ref=e1" onclick="this.textContent=\'saved\'">save</button>',

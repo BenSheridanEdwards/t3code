@@ -150,6 +150,11 @@ export function createCdpRelayConnection(
     if (command.method === "Runtime.runIfWaitingForDebugger" && child === undefined) {
       return Promise.resolve({});
     }
+    // Playwright turns focus emulation on for every page it connects to, and
+    // Chromium treats such a page as captured: a guest the panel hides kept
+    // running its timers unthrottled. The guest's real focus stays in charge;
+    // GuestInput already delivers input without it.
+    if (command.method === "Emulation.setFocusEmulationEnabled") return Promise.resolve({});
     return target.send(command.method, command.params ?? {}, child);
   };
 

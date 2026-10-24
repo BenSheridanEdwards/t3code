@@ -671,6 +671,23 @@ export const click = async (
   return point;
 };
 
+interface TypeTarget {
+  readonly tagName: string;
+  readonly type?: string;
+  readonly disabled?: boolean;
+  readonly readOnly?: boolean;
+  readonly isContentEditable?: boolean;
+  readonly focus?: () => void;
+  readonly getRootNode: () => { readonly activeElement?: unknown };
+  readonly contains: (node: unknown) => boolean;
+}
+
+const ACTIVE_ELEMENT_SCRIPT = `(() => {
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  return active;
+})()`;
+
 export const type = async (page: Page, input: PreviewAutomationTypeInput) => {
   const timeout = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const locator = targetLocator(page, input);
@@ -678,48 +695,47 @@ export const type = async (page: Page, input: PreviewAutomationTypeInput) => {
     await locator.fill(input.text, { timeout });
     return;
   }
-  // A shadow host also matches :focus; use its innermost focused descendant.
-  const target = locator ?? page.locator("*:focus").last();
-  const focused =
-    (locator !== null || (await target.count()) > 0) &&
-    (await target.evaluate(
-      (element) => {
-        // Like the desktop host: an enabled text control or contenteditable
-        // that actually takes focus. Anything else would swallow the text or
-        // send it to whichever field had focus before.
-        const control = element as unknown as {
-          readonly type?: string;
-          readonly disabled?: boolean;
-          readonly readOnly?: boolean;
-          readonly isContentEditable?: boolean;
-          readonly focus?: () => void;
-        };
-        const nonText = [
-          "button",
-          "checkbox",
-          "color",
-          "file",
-          "hidden",
-          "image",
-          "radio",
-          "range",
-          "reset",
-          "submit",
-        ];
-        const textControl =
-          element.tagName === "TEXTAREA" ||
-          (element.tagName === "INPUT" && !nonText.includes(control.type ?? "text"));
-        if (!(textControl || control.isContentEditable) || control.disabled || control.readOnly) {
-          return false;
-        }
-        control.focus?.();
-        const root = element.getRootNode() as { readonly activeElement?: typeof element | null };
-        const active = root.activeElement;
-        return active != null && (active === element || element.contains(active));
-      },
-      undefined,
-      { timeout },
-    ));
+  // Like the desktop host: an enabled text control or contenteditable that
+  // actually takes focus. Anything else would swallow the text or send it to
+  // whichever field had focus before.
+  const takesText = (control: TypeTarget | null) => {
+    if (control === null) return false;
+    const nonText = [
+      "button",
+      "checkbox",
+      "color",
+      "file",
+      "hidden",
+      "image",
+      "radio",
+      "range",
+      "reset",
+      "submit",
+    ];
+    const textControl =
+      control.tagName === "TEXTAREA" ||
+      (control.tagName === "INPUT" && !nonText.includes(control.type ?? "text"));
+    if (!(textControl || control.isContentEditable) || control.disabled || control.readOnly) {
+      return false;
+    }
+    control.focus?.();
+    const active = control.getRootNode().activeElement;
+    return active != null && (active === control || control.contains(active));
+  };
+  // Without a locator, type into the page's own active element. :focus also
+  // needs the page itself to have focus, which a guest loses whenever the app
+  // around it (or another window) takes focus.
+  let focused: boolean;
+  if (locator === null) {
+    const active = await page.evaluateHandle<TypeTarget | null>(ACTIVE_ELEMENT_SCRIPT);
+    try {
+      focused = await active.evaluate(takesText);
+    } finally {
+      await active.dispose();
+    }
+  } else {
+    focused = await locator.evaluate(takesText, undefined, { timeout });
+  }
   if (focused !== true) {
     throw new ServerBrowserOperationError(
       "PreviewAutomationTargetNotEditableError",
