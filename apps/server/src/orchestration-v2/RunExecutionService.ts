@@ -1228,7 +1228,7 @@ export const layer: Layer.Layer<
             }
           }
         });
-        const shouldStopProviderEventIngestion = Effect.gen(function* () {
+        const agentTurnsSettled = Effect.gen(function* () {
           if (!(yield* Ref.get(rootTerminalSeen))) {
             return false;
           }
@@ -1245,8 +1245,19 @@ export const layer: Layer.Layer<
             return false;
           }
           const childSubagents = yield* Ref.get(activeChildSubagents);
-          if (childSubagents.size > 0) {
+          return childSubagents.size === 0;
+        });
+        const shouldStopProviderEventIngestion = Effect.gen(function* () {
+          if (!(yield* agentTurnsSettled)) {
             return false;
+          }
+          const terminal = yield* Ref.get(terminalEvent);
+          if (
+            terminal !== null &&
+            terminal.status !== "completed" &&
+            !childTurnsContinue(terminal)
+          ) {
+            return true;
           }
           // Newly owned items depend on adapters emitting a non-terminal event before the root
           // terminal. Owner loss (a newer run claimed lastRunOrdinal) must not close this stream
@@ -1277,8 +1288,9 @@ export const layer: Layer.Layer<
         // Held text writes nothing, so its item would take a position only
         // when finally written, behind every item that began after it.
         const reservedHeldTurnItemIds = new Set<TurnItemId>();
-        // Ends with the consumer rather than the root turn, so the agent's browser tab
-        // stays focused while children and background work it still drives continue.
+        // Ends once the root turn and the children it drives settle, so the agent's browser
+        // tab stays focused between their tool calls. Background commands such as a dev
+        // server keep the consumer alive for the session and must not pin focus with it.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
         const providerEventFiber = yield* eventSubscription.events.pipe(
           Stream.mapEffect((event) =>
@@ -1448,6 +1460,7 @@ export const layer: Layer.Layer<
                 yield* finalizeRootRun(event);
               }
               yield* trackChildLifecycle(event, deliveredEvent !== null);
+              if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
