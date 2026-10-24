@@ -1,3 +1,4 @@
+import { OrchestratorMcpTaskRole } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 const PriorToolCall = Schema.Struct({
@@ -6,26 +7,32 @@ const PriorToolCall = Schema.Struct({
   result: Schema.Unknown,
 });
 
+/**
+ * One expected call. `args` match partially: `~text` is a case-insensitive substring,
+ * `"<=N"` / `">=N"` bound a number, and keys may be dotted paths.
+ */
+const McpToolUseCall = Schema.Struct({
+  tool: Schema.String,
+  args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+});
+export type McpToolUseCall = typeof McpToolUseCall.Type;
+
 /** Grading rules. Tool names are bare: `delegate_task`, `Bash`, `Agent`. */
 export const McpToolUseExpect = Schema.Struct({
-  /** Each entry needs one matching call. `args` match partially; `~text` is a substring. */
-  calls: Schema.optional(
-    Schema.Array(
-      Schema.Struct({
-        tool: Schema.String,
-        args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
-      }),
-    ),
-  ),
+  /** Each entry needs one matching call. */
+  calls: Schema.optional(Schema.Array(McpToolUseCall)),
+  /** No call may match any entry. */
+  callsMustNot: Schema.optional(Schema.Array(McpToolUseCall)),
   notCalls: Schema.optional(Schema.Array(Schema.String)),
   /** First calls of these tools happen in this order. */
   order: Schema.optional(Schema.Array(Schema.String)),
+  minCalls: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
   maxCalls: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
   /** The last step with tool calls includes this tool, then the turn ends. */
   endsTurnAfter: Schema.optional(Schema.String),
   /** Regexes that no shell command may match. */
   shellMustNot: Schema.optional(Schema.Array(Schema.String)),
-  /** Case-insensitive regexes on the agent's visible text. */
+  /** Case-sensitive regexes on the agent's visible text. */
   textMust: Schema.optional(Schema.Array(Schema.String)),
   textMustNot: Schema.optional(Schema.Array(Schema.String)),
 });
@@ -41,6 +48,8 @@ export const McpToolUseCase = Schema.Struct({
   privacy: Schema.optional(Schema.Literals(["commit-safe", "private"])),
   setup: Schema.Struct({
     role: Schema.Literals(["top", "delegated-child", "native-subagent"]),
+    /** delegate_task `role` for a delegated child. T3 builds the child's first message from it. */
+    delegateRole: Schema.optional(OrchestratorMcpTaskRole),
     context: Schema.optional(Schema.String),
     priorTurns: Schema.optional(
       Schema.Array(
@@ -126,7 +135,7 @@ export const mcpToolUseEvaluationCases: ReadonlyArray<McpToolUseCase> = [
       calls: [
         {
           tool: "delegate_task",
-          args: { "target.providerInstanceId": "codex", "target.options": "~max" },
+          args: { "target.providerInstanceId": "codex", "target.options.reasoningEffort": "max" },
         },
       ],
       order: ["orchestrator_capabilities", "delegate_task"],
@@ -166,6 +175,7 @@ export const mcpToolUseEvaluationCases: ReadonlyArray<McpToolUseCase> = [
     privacy: "commit-safe",
     setup: {
       role: "delegated-child",
+      delegateRole: "implementation",
       shellMocks: [
         { match: "gh pr create", output: "https://github.com/acme/app/pull/124" },
         {
