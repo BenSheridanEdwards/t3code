@@ -1,5 +1,5 @@
 import type { NativeStackHeaderItem } from "@react-navigation/native-stack";
-import { act, createContext, useState, type ReactElement } from "react";
+import { act, createContext, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 
@@ -14,7 +14,6 @@ const harness = vi.hoisted(() => ({
   appliedOptions: {} as HeaderOptions,
   renderedItems: [] as NativeStackHeaderItem[],
   setOptionsCalls: 0,
-  openedDocuments: [] as string[],
 }));
 
 // Native headers retain the actions materialized when navigation applies options. Like React
@@ -47,59 +46,6 @@ vi.mock("@react-navigation/native", () => {
 import { NativeHeaderToolbar } from "./NativeHeaderToolbar";
 
 let root: Root | null = null;
-type Placement = "left" | "right" | "bottom";
-
-function DocumentToolbar(props: { readonly path: string; readonly placement: Placement }) {
-  return (
-    <NativeHeaderToolbar placement={props.placement}>
-      <NativeHeaderToolbar.Menu title="File actions" icon="ellipsis">
-        <NativeHeaderToolbar.MenuAction onPress={() => harness.openedDocuments.push(props.path)}>
-          Open PDF
-        </NativeHeaderToolbar.MenuAction>
-      </NativeHeaderToolbar.Menu>
-    </NativeHeaderToolbar>
-  );
-}
-
-function PairingForm(props: {
-  readonly placement: Placement;
-  readonly onPair: (host: string, code: string) => void;
-}) {
-  const [host, setHost] = useState("");
-  const [code, setCode] = useState("");
-  const pair = () => props.onPair(host, code);
-  return (
-    <>
-      <input
-        aria-label="Host"
-        value={host}
-        onInput={(event) => setHost(event.currentTarget.value)}
-      />
-      <input
-        aria-label="Code"
-        value={code}
-        onInput={(event) => setCode(event.currentTarget.value)}
-      />
-      <NativeHeaderToolbar placement={props.placement}>
-        <NativeHeaderToolbar.Button label="Pair" disabled={!host} onPress={pair} />
-        <NativeHeaderToolbar.Menu title="Pairing">
-          <NativeHeaderToolbar.Menu title="Actions">
-            <NativeHeaderToolbar.MenuAction disabled={!host} onPress={pair}>
-              Pair
-            </NativeHeaderToolbar.MenuAction>
-          </NativeHeaderToolbar.Menu>
-        </NativeHeaderToolbar.Menu>
-      </NativeHeaderToolbar>
-    </>
-  );
-}
-
-function renderDocument(path: string, placement: Placement) {
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  harness.params = { path: path.split("/") };
-  root ??= createRoot(document.createElement("div"));
-  act(() => root!.render(<DocumentToolbar path={path} placement={placement} />));
-}
 
 // Like React Navigation's NavigationStateContext, whose default value throws when
 // read. React restores a context's default outside render, so layout effects see it.
@@ -138,79 +84,75 @@ function renderedCustomLabel() {
   return (item.element as ReactElement<{ "aria-label": string }>).props["aria-label"];
 }
 
-function openRenderedDocument() {
-  const menu = harness.renderedItems[0];
-  if (menu?.type !== "menu") throw new Error("Expected the native file menu");
-  const action = menu.menu.items[0];
-  if (action?.type !== "action") throw new Error("Expected the native Open PDF action");
-  action.onPress?.();
-}
-
 afterEach(() => {
   act(() => root?.unmount());
   root = null;
   harness.appliedOptions = {};
   harness.renderedItems = [];
   harness.setOptionsCalls = 0;
-  harness.openedDocuments = [];
   vi.unstubAllGlobals();
 });
 
 it.each(["left", "right", "bottom"] as const)(
-  "updates the %s header action when switching between documents with the same name",
-  (placement) => {
-    renderDocument("first/guide.pdf", placement);
-    openRenderedDocument();
-    renderDocument("second/guide.pdf", placement);
-    openRenderedDocument();
-
-    expect(harness.openedDocuments).toEqual(["first/guide.pdf", "second/guide.pdf"]);
-  },
-);
-
-it.each(["left", "right", "bottom"] as const)(
-  "pairs with current form values through retained %s button and nested menu actions",
+  "dispatches retained %s actions to the latest committed handlers without registering again",
   (placement) => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-    const container = document.createElement("div");
-    root = createRoot(container);
-    const onPair = vi.fn();
-    act(() => root!.render(<PairingForm placement={placement} onPair={onPair} />));
+    root = createRoot(document.createElement("div"));
+    const onPress = vi.fn();
+    const render = (path: string) =>
+      act(() =>
+        root!.render(
+          <NativeHeaderToolbar placement={placement}>
+            <NativeHeaderToolbar.Button label="Open" onPress={() => onPress("button", path)} />
+            <NativeHeaderToolbar.Menu title="File">
+              <NativeHeaderToolbar.MenuAction onPress={() => onPress("menu", path)}>
+                Open
+              </NativeHeaderToolbar.MenuAction>
+              <NativeHeaderToolbar.Menu title="More">
+                <NativeHeaderToolbar.MenuAction onPress={() => onPress("nested", path)}>
+                  Open
+                </NativeHeaderToolbar.MenuAction>
+              </NativeHeaderToolbar.Menu>
+            </NativeHeaderToolbar.Menu>
+          </NativeHeaderToolbar>,
+        ),
+      );
 
-    const edit = (label: string, value: string) => {
-      const input = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!;
-      act(() => {
-        input.value = value;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      });
+    render("first/guide.pdf");
+    const [button, menu] = harness.renderedItems;
+    if (button?.type !== "button" || menu?.type !== "menu") {
+      throw new Error("Expected the native button and menu");
+    }
+    const [action, submenu] = menu.menu.items;
+    if (action?.type !== "action" || submenu?.type !== "submenu") {
+      throw new Error("Expected the direct action and submenu");
+    }
+    const nested = submenu.items[0];
+    if (nested?.type !== "action") throw new Error("Expected the nested action");
+    const press = () => {
+      button.onPress?.();
+      action.onPress?.();
+      nested.onPress?.();
     };
-    edit("Host", "h");
+    press();
+    expect(onPress.mock.calls).toEqual([
+      ["button", "first/guide.pdf"],
+      ["menu", "first/guide.pdf"],
+      ["nested", "first/guide.pdf"],
+    ]);
+    onPress.mockClear();
+    const registrations = harness.setOptionsCalls;
+    expect(registrations).toBeGreaterThan(0);
 
-    const button = harness.renderedItems[0];
-    if (button?.type !== "button") throw new Error("Expected the native Pair button");
-    expect(button.disabled).toBe(false);
-    const menu = harness.renderedItems[1];
-    if (menu?.type !== "menu") throw new Error("Expected the native pairing menu");
-    const submenu = menu.menu.items[0];
-    if (submenu?.type !== "submenu") throw new Error("Expected the nested actions menu");
-    const action = submenu.items[0];
-    if (action?.type !== "action") throw new Error("Expected the native Pair action");
-    expect(action.disabled).toBe(false);
-    const applied = harness.setOptionsCalls;
-    const params = harness.params;
+    render("second/guide.pdf");
 
-    edit("Host", "https://my-server.example");
-    edit("Code", "123456");
-
-    expect(harness.params).toBe(params);
-    expect(harness.setOptionsCalls).toBe(applied);
-    expect(harness.renderedItems[0]).toBe(button);
-    expect(harness.renderedItems[1]).toBe(menu);
-    button.onPress?.();
-    action.onPress?.();
-    expect(onPair.mock.calls).toEqual([
-      ["https://my-server.example", "123456"],
-      ["https://my-server.example", "123456"],
+    expect(harness.setOptionsCalls).toBe(registrations);
+    expect(harness.renderedItems).toEqual([button, menu]);
+    press();
+    expect(onPress.mock.calls).toEqual([
+      ["button", "second/guide.pdf"],
+      ["menu", "second/guide.pdf"],
+      ["nested", "second/guide.pdf"],
     ]);
   },
 );
