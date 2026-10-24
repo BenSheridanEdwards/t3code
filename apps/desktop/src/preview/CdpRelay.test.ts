@@ -95,6 +95,31 @@ describe("CDP relay", () => {
     expect(send.mock.calls).toEqual([["Runtime.runIfWaitingForDebugger", {}, "iframe-session"]]);
   });
 
+  // Playwright enables focus emulation on every page it connects to, and Chromium then
+  // counts the guest as captured: a preview the panel hides keeps its timers unthrottled.
+  it("acknowledges Playwright's focus emulation without forcing it onto the guest", async () => {
+    const send = vi.fn(async () => ({}));
+    const written: Array<Record<string, unknown>> = [];
+    const relay = createCdpRelayConnection(makeTarget(send), (raw) =>
+      written.push(JSON.parse(raw)),
+    );
+    relay.receive(
+      JSON.stringify({
+        id: 1,
+        method: "Emulation.setFocusEmulationEnabled",
+        params: { enabled: true },
+        sessionId: "t3-preview-page",
+      }),
+    );
+    await settle();
+    expect(written).toEqual([{ id: 1, result: {}, sessionId: "t3-preview-page" }]);
+    expect(send).not.toHaveBeenCalledWith(
+      "Emulation.setFocusEmulationEnabled",
+      { enabled: true },
+      undefined,
+    );
+  });
+
   it("routes tab events to the page session once the page is announced", async () => {
     const written: Array<Record<string, unknown>> = [];
     const relay = createCdpRelayConnection(makeTarget(vi.fn()), (raw) =>
