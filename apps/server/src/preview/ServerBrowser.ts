@@ -91,6 +91,7 @@ const RENDER_SCALE = 2;
 // Chromium allows three unacked frames, so 100 ms pacing caps viewers near 30 fps.
 const SCREENCAST_ACK_PACE_MS = 100;
 const SCREENCAST_SETTLE_MS = 200;
+const VIEWER_STILL_TIMEOUT_MS = 2_000;
 const SCREENCAST_MOTION_FRAMES = 4;
 const SCREENCAST_MOTION_WINDOW_MS = 300;
 const SCREENCAST_MOTION_QUALITY = 50;
@@ -2337,8 +2338,13 @@ const make = Effect.gen(function* () {
   )(function* (input) {
     const tab = yield* findTab(input.threadId, input.tabId);
     // A hidden guest paints no screencast frames or stills unless it behaves as focused.
-    yield* Effect.acquireRelease(
-      Effect.promise(() => holdDesktopFocus(tab)),
+    const releaseFocus = yield* Effect.acquireRelease(
+      Effect.promise(() => holdDesktopFocus(tab)).pipe(
+        Effect.map((release) => {
+          let released: Promise<void> | null = null;
+          return () => (released ??= release());
+        }),
+      ),
       (release) => Effect.promise(release),
     );
     const output = yield* Queue.make<ServerBrowserViewerOutput>({
@@ -2431,20 +2437,37 @@ const make = Effect.gen(function* () {
           reportLiveTabs();
         }),
     );
+    // Runs before the cleanup above, so a stalled stop or detach cannot keep the guest focused.
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(() => {
+        closed = true;
+        return releaseFocus();
+      }),
+    );
     if (input.canOperate && tab.control.agentId === null && tab.control.controller === null) {
       yield* Effect.promise(() => tab.control.take(viewer.id));
     }
     broadcastControl(tab);
     pushFileChooser(tab);
     // Full scale: a scaled capture would flash in every other viewer.
+    // A hidden guest can leave the capture unanswered; bound it so the lock frees.
     const pushStill = async () => {
-      const data = await withCaptureLock(tab, () =>
-        ServerBrowserPage.captureViewport(tab.page, session, {
-          format: "jpeg",
-          quality,
-          scale: 1,
-        }),
-      ).catch(() => null);
+      const data = await withCaptureLock(tab, () => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        return Promise.race([
+          ServerBrowserPage.captureViewport(tab.page, session, {
+            format: "jpeg",
+            quality,
+            scale: 1,
+          }),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("The still timed out.")),
+              VIEWER_STILL_TIMEOUT_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(timer));
+      }).catch(() => null);
       if (data) viewer.push({ _tag: "frame", data: Buffer.from(data, "base64"), ack: Effect.void });
     };
     let settleTimer: ReturnType<typeof setTimeout> | null = null;

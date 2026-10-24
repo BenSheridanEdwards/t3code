@@ -772,6 +772,76 @@ it.live("a desktop tab is held focused only by agent operations and viewers", ()
   ).pipe(Effect.provide(layer)),
 );
 
+// A hidden guest paints while focused, so a stalled CDP cleanup must not keep it focused.
+it.live("a closing viewer releases desktop focus before its screencast stop", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const manager = yield* Manager.PreviewManager;
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const broker = yield* Broker.PreviewAutomationBroker;
+      yield* Effect.yieldNow;
+      desktopRendersNext = true;
+      const opened = yield* manager.open({ threadId: scope.thread.threadId, runtime: "server" });
+      const tabId = PreviewTabId.make(opened.tabId);
+      yield* broker.invoke({ scope, tabId, operation: "status", input: {} });
+      const viewerScope = yield* Scope.make();
+      yield* browser.attachViewer(viewerInput(tabId, false)).pipe(Scope.provide(viewerScope));
+      const session = desktopConnections[0]!.context.sessions.at(-1)!;
+      const send = session.send.getMockImplementation()!;
+      const stopping = Promise.withResolvers<void>();
+      const stalled = Promise.withResolvers<Record<string, unknown>>();
+      session.send.mockImplementation(async (method, input) => {
+        if (method !== "Page.stopScreencast") return send(method, input);
+        stopping.resolve();
+        return stalled.promise;
+      });
+      desktopFocus.length = 0;
+
+      const closing = yield* Scope.close(viewerScope, Exit.void).pipe(Effect.forkScoped);
+      yield* Effect.promise(() => stopping.promise);
+      expect(desktopFocus).toEqual(["focus:false"]);
+      stalled.resolve({});
+      yield* Fiber.join(closing);
+      expect(desktopFocus).toEqual(["focus:false"]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a hanging initial still neither blocks a viewer's attach nor its teardown", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const manager = yield* Manager.PreviewManager;
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const broker = yield* Broker.PreviewAutomationBroker;
+      yield* Effect.yieldNow;
+      desktopRendersNext = true;
+      const opened = yield* manager.open({ threadId: scope.thread.threadId, runtime: "server" });
+      const tabId = PreviewTabId.make(opened.tabId);
+      yield* broker.invoke({ scope, tabId, operation: "status", input: {} });
+      const context = desktopConnections[0]!.context;
+      const newCDPSession = context.newCDPSession;
+      const capturing = Promise.withResolvers<void>();
+      context.newCDPSession = async (target) => {
+        const session = await newCDPSession(target);
+        const send = session.send.getMockImplementation()!;
+        session.send.mockImplementation(async (method, input) => {
+          if (method !== "Page.captureScreenshot") return send(method, input);
+          capturing.resolve();
+          return new Promise<never>(() => {});
+        });
+        return session;
+      };
+      desktopFocus.length = 0;
+
+      const viewerScope = yield* Scope.make();
+      yield* browser.attachViewer(viewerInput(tabId, false)).pipe(Scope.provide(viewerScope));
+      yield* Effect.promise(() => capturing.promise);
+      yield* Scope.close(viewerScope, Exit.void);
+      expect(desktopFocus).toEqual(["focus:true", "focus:false"]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 // Blurring between tools fires real blur events, which close the dropdown a typed field opened.
 it.live("an agent's tab stays focused across its execution's tool calls", () =>
   Effect.scoped(
