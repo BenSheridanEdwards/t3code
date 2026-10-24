@@ -1433,6 +1433,9 @@ const make = Effect.gen(function* () {
     readiness: "load" | "domContentLoaded" | "none",
     timeout: number,
   ) => {
+    // The operation responds at commit, but autofocus and focus handlers run as the
+    // page initializes, so the navigation holds focus until load, failure, or close.
+    const releaseFocus = readiness === "none" ? await holdDesktopFocus(tab) : null;
     const navigation = tab.page.goto(url, {
       timeout,
       waitUntil:
@@ -1442,8 +1445,12 @@ const make = Effect.gen(function* () {
             ? "commit"
             : "load",
     });
-    if (readiness === "none") {
+    if (releaseFocus) {
       tab.control.track(navigation);
+      void navigation
+        .then(() => tab.page.waitForLoadState("load", { timeout }))
+        .catch(constVoid)
+        .finally(releaseFocus);
       return;
     }
     await navigation.catch((cause: unknown) => {

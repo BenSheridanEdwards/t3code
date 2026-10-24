@@ -280,6 +280,7 @@ const desktopRenders = (tabId: string) => {
 const releasedDesktopTabs: Array<string> = [];
 const desktopFocus: Array<string> = [];
 const desktopFocusHolders: Array<string> = [];
+let onDesktopFocus: ((hold: boolean) => void) | null = null;
 const desktopConnections: Array<{ endpoint: string; context: ReturnType<typeof makeContext> }> = [];
 const testThread = {
   threadId: ThreadId.make("browser-test-thread"),
@@ -344,6 +345,7 @@ const dependencies = Layer.mergeAll(
       Effect.sync(() => {
         desktopFocusHolders.push(holder);
         desktopFocus.push(`focus:${hold}`);
+        onDesktopFocus?.(hold);
       }),
   }),
 ).pipe(
@@ -387,6 +389,7 @@ beforeEach(() => {
   releasedDesktopTabs.length = 0;
   desktopFocus.length = 0;
   desktopFocusHolders.length = 0;
+  onDesktopFocus = null;
   desktopConnections.length = 0;
 });
 
@@ -763,6 +766,55 @@ it.live("a desktop tab is held focused only by agent operations and viewers", ()
       expect(desktopFocus).toEqual(["focus:true"]);
       yield* Scope.close(viewerScope, Exit.void);
       expect(desktopFocus).toEqual(["focus:true", "focus:false"]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+// The page initializes after a commit-readiness navigate responds, so it keeps focus until load.
+it.live("a navigation that responds at commit holds focus until the page loads", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.yieldNow;
+      desktopRendersNext = true;
+      const opened = yield* manager.open({ threadId: scope.thread.threadId, runtime: "server" });
+      const tabId = PreviewTabId.make(opened.tabId);
+      yield* broker.invoke({ scope, tabId, operation: "status", input: {} });
+      const page = desktopConnections[0]!.context.page;
+      const committed = Promise.withResolvers<void>();
+      const loaded = Promise.withResolvers<void>();
+      page.goto.mockImplementationOnce(() => committed.promise);
+      const awaitingLoad = Promise.withResolvers<void>();
+      page.waitForLoadState.mockImplementationOnce(() => {
+        awaitingLoad.resolve();
+        return loaded.promise;
+      });
+      desktopFocus.length = 0;
+      desktopFocusHolders.length = 0;
+
+      yield* broker.invoke({
+        scope,
+        tabId,
+        operation: "navigate",
+        input: { url: "http://localhost:5173/", readiness: "none" },
+      });
+      expect(desktopFocus).toEqual(["focus:true", "focus:true", "focus:false"]);
+      const navigationHolder = desktopFocusHolders.find(
+        (holder) => holder !== desktopFocusHolders[2],
+      );
+
+      const released = Promise.withResolvers<void>();
+      onDesktopFocus = (hold) => {
+        if (!hold) released.resolve();
+      };
+      committed.resolve();
+      yield* Effect.promise(() => awaitingLoad.promise);
+      expect(desktopFocus).toHaveLength(3);
+      loaded.resolve();
+      yield* Effect.promise(() => released.promise);
+      expect(desktopFocus.at(-1)).toBe("focus:false");
+      expect(desktopFocusHolders.at(-1)).toBe(navigationHolder);
     }),
   ).pipe(Effect.provide(layer)),
 );
