@@ -4,11 +4,13 @@ import {
   buildBase,
   buildMessages,
   gradeSample,
+  makeSample,
   type SampleRun,
   t3SystemAppend,
 } from "./evaluate-mcp-tool-use.ts";
 import { taskPrompt } from "../src/mcp/OrchestratorMcpService.ts";
 import { mcpToolUseEvaluationCases } from "./mcpToolUseEvaluationCases.ts";
+import { makeWorld, runFileTool, runShell } from "./mcpToolUseWorld.ts";
 
 const failed = (expect: Parameters<typeof gradeSample>[0], run: SampleRun) =>
   gradeSample(expect, run)
@@ -148,9 +150,68 @@ it("rebuilds the template from this checkout and sends a child T3's task prompt"
     (testCase) => testCase.id === "delegated-child-does-not-watch",
   );
   if (child === undefined) throw new Error("Missing delegated child case.");
-  const prompt = buildMessages({ testCase: child, base, tools: [...base.nativeTools] })
-    .at(-1)
-    ?.content.at(-1);
+  const prompt = buildMessages(makeSample(child, base)).at(-1)?.content.at(-1);
   assert.equal(prompt?.text, taskPrompt({ task: child.prompt, role: "implementation" }));
   assert.notEqual(prompt?.text, child.prompt);
+});
+
+it("answers shell and file tools from the case's fake world", () => {
+  const world = makeWorld(
+    {
+      branch: "fix/socket",
+      branches: { "fix/base": "abc1234" },
+      commits: [
+        { sha: "def5678", subject: "fix(web): keep a healthy socket" },
+        { sha: "abc1234", subject: "fix(web): add socket state" },
+      ],
+      diff: "diff --git a/src/socket.ts b/src/socket.ts\n--- a/src/socket.ts\n+++ b/src/socket.ts\n@@ -1 +1 @@\n-old\n+new\n",
+      files: { "docs/plan.md": "# Plan\n- lane D\n" },
+      prs: [{ number: 123, title: "fix(ws): backoff", headRefName: "fix/ws-backoff" }],
+      pages: { "https://docs.acme.test": "<h1>Docs</h1>" },
+    },
+    { cwd: "/repo", platform: "linux" },
+  );
+  const mocks = [{ match: "^gh pr checks", output: "Check\tpending" }];
+  const shell = (command: string) => runShell(world, mocks, command).text;
+  assert.equal(shell("cd docs && pwd; git branch --show-current"), "/repo/docs\nfix/socket");
+  assert.equal(
+    shell("git log --oneline fix/base..HEAD | head -5"),
+    "def5678 fix(web): keep a healthy socket",
+  );
+  assert.equal(shell("git log --oneline HEAD..origin/main"), "(Bash completed with no output)");
+  assert.equal(shell("cat src/socket.ts || grep -n lane docs/plan.md"), "new");
+  assert.equal(
+    shell("cat nope.md || grep -n lane docs/plan.md"),
+    "cat: nope.md: No such file or directory\ndocs/plan.md:2:- lane D",
+  );
+  assert.equal(
+    shell("git push -u origin HEAD 2>&1 && gh pr checks"),
+    "To github.com:acme/app.git\n * [new branch]      fix/socket -> fix/socket\nCheck\tpending",
+  );
+  assert.equal(
+    shell('gh pr create --title "fix: socket" --body "a; b && c"'),
+    "https://github.com/acme/app/pull/124",
+  );
+  assert.equal(shell("gh pr view --json number,headRefName --jq .headRefName"), "fix/socket");
+  assert.equal(
+    shell("curl -s https://docs.acme.test/start -o /tmp/p.html -w '%{http_code}'; cat /tmp/p.html"),
+    "200\n<h1>Docs</h1>",
+  );
+  assert.deepEqual(runShell(world, [], "ls missing"), {
+    text: "Exit code 1\nls: cannot access 'missing': No such file or directory",
+    error: true,
+  });
+
+  assert.isFalse(
+    runFileTool(world, "Edit", { file_path: "docs/plan.md", old_string: "D", new_string: "E" })
+      ?.error,
+  );
+  assert.equal(
+    runFileTool(world, "Read", { file_path: "/repo/docs/plan.md" })?.text,
+    "     1\t# Plan\n     2\t- lane E",
+  );
+  assert.match(
+    shell("git commit -am 'docs: rename lane'; git status --short"),
+    /^\[fix\/socket \w{7}\] docs: rename lane/,
+  );
 });

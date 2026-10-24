@@ -1,6 +1,8 @@
 import { OrchestratorMcpTaskRole } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
+import { McpToolUseWorld } from "./mcpToolUseWorld.ts";
+
 const PriorToolCall = Schema.Struct({
   tool: Schema.String,
   input: Schema.Unknown,
@@ -60,8 +62,11 @@ export const McpToolUseCase = Schema.Struct({
         }),
       ),
     ),
-    /** Canned T3 tool results by bare name. `"default"` uses the runner's generic result. */
+    /** The repo the agent's shell and file tools see. Unset keys use a small default repo. */
+    world: Schema.optional(McpToolUseWorld),
+    /** Canned tool results by bare name, T3 or native. `"default"` uses the runner's result. */
     mocks: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+    /** Regexes on one part of a shell command. A match wins over the world's built-in output. */
     shellMocks: Schema.optional(
       Schema.Array(Schema.Struct({ match: Schema.String, output: Schema.String })),
     ),

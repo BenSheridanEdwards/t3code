@@ -7,7 +7,7 @@
  * two branches A/B tests an instruction rewrite.
  *
  *   node scripts/evaluate-mcp-tool-use.ts --template <capture.json> --out <dir> [--cases <file.jsonl>]...
- *   node scripts/evaluate-mcp-tool-use.ts --template <capture.json> --dry-run [--case <id>]
+ *   node scripts/evaluate-mcp-tool-use.ts --template <capture.json> --dry-run [--case <id>[,<id>]]
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeUtil from "node:util";
@@ -45,6 +45,14 @@ import {
   McpToolUseCase,
   mcpToolUseEvaluationCases,
 } from "./mcpToolUseEvaluationCases.ts";
+import {
+  gitStatusReminder,
+  makeWorld,
+  runFileTool,
+  runShell,
+  type World,
+  webPage,
+} from "./mcpToolUseWorld.ts";
 
 const MODEL = "claude-sonnet-5-5";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
@@ -155,6 +163,29 @@ export const t3SystemAppend = () => {
   throw new Error("makeClaudeQueryOptions no longer appends T3 text to a preset prompt.");
 };
 
+const stringProperty = (description: string) => ({ type: "string", description });
+const NATIVE_SCHEMAS: Readonly<Record<string, Omit<ApiTool, "name">>> = {
+  WebFetch: {
+    description: "Fetches content from a URL and answers the prompt about it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: stringProperty("The URL to fetch"),
+        prompt: stringProperty("What to extract"),
+      },
+      required: ["url", "prompt"],
+    },
+  },
+  WebSearch: {
+    description: "Searches the web and returns result titles, links, and snippets.",
+    input_schema: {
+      type: "object",
+      properties: { query: stringProperty("The search query") },
+      required: ["query"],
+    },
+  },
+};
+
 /** Rebuilds the parts of a captured request that every case shares. */
 export const buildBase = (
   template: typeof MessagesRequest.Type,
@@ -184,29 +215,68 @@ export const buildBase = (
       .replace(MODEL_LINE, sonnet);
   });
   const [first] = template.messages;
-  // The last block is the captured prompt. gitStatus names a real repo state.
+  // The last block is the captured prompt.
   const reminders = (first?.role === "user" ? texts(first.content).slice(0, -1) : []).filter(
     (value) =>
-      !value.includes("# gitStatus") &&
-      (options.keepUserInstructions || !value.includes("Codebase and user instructions are")),
+      options.keepUserInstructions || !value.includes("Codebase and user instructions are"),
   );
-  // Claude Code sends no schema for tools it only names, so those load open.
+  // gitStatus names a real repo state. Each case gets one built from its fake world instead.
+  const gitStatusAt = reminders.findIndex((value) => value.includes("# gitStatus"));
+  const joined = systemTexts.join("\n");
+  // Claude Code sends no schema for tools it only names. Web tools get their usual one, the
+  // rest load open.
   const open = { type: "object", additionalProperties: true };
+  const nativeSchema = (name: string) =>
+    NATIVE_SCHEMAS[name] ?? { description: name, input_schema: open };
   return {
     system: system.map(text),
-    reminders: reminders.map(text),
+    reminders: reminders.filter((_, i) => i !== gitStatusAt).map(text),
+    gitStatusAt: gitStatusAt === -1 ? reminders.length : gitStatusAt,
+    /** The fake world's cwd and OS follow the template's environment section. */
+    environment: {
+      cwd: /Primary working directory: (\S+)/.exec(joined)?.[1] ?? "/home/user/app",
+      platform: /Platform: (\w+)/.exec(joined)?.[1] ?? "linux",
+    },
     nativeTools: template.tools.filter((tool) => !isT3Name(tool.name)),
     /** Tools ToolSearch loads: T3 tools from source, and native tools the template only names. */
-    deferred: [
-      ...t3Tools,
-      ...nativeDeferred.map((name) => ({ name, description: name, input_schema: open })),
-    ],
+    deferred: [...t3Tools, ...nativeDeferred.map((name) => ({ name, ...nativeSchema(name) }))],
   };
 };
 
 type Base = ReturnType<typeof buildBase>;
-/** One sample's request state. ToolSearch adds loaded schemas to `tools`, like Claude Code. */
-type Sample = { testCase: McpToolUseCase; base: Base; tools: Array<ApiTool> };
+/**
+ * One sample's state. ToolSearch adds loaded schemas to `tools`, like Claude Code. `world` is the
+ * sample's own copy of the fake repo; `linked` and `nextTask` keep T3 results consistent.
+ */
+type Sample = {
+  readonly testCase: McpToolUseCase;
+  readonly base: Base;
+  readonly tools: Array<ApiTool>;
+  readonly world: World;
+  readonly linked: Set<string>;
+  nextTask: number;
+};
+
+export const makeSample = (testCase: McpToolUseCase, base: Base): Sample => {
+  const prior = testCase.setup.priorTurns ?? [];
+  const priorCalls = prior.flatMap((turn) => turn.toolCalls ?? []);
+  const urls = priorCalls.flatMap((call) =>
+    ["link_pull_request", "watch_pull_request"].includes(call.tool) && isRecord(call.input)
+      ? [valueText(call.input.url)]
+      : [],
+  );
+  const taskNumbers = [...valueText(prior).matchAll(/task-(\d+)/g)].map((match) =>
+    Number(match[1]),
+  );
+  return {
+    testCase,
+    base,
+    tools: [...base.nativeTools],
+    world: makeWorld(testCase.setup.world, base.environment),
+    linked: new Set(urls),
+    nextTask: Math.max(0, ...taskNumbers) + 1,
+  };
+};
 
 const findTool = (base: Base, bare: string) =>
   [...base.nativeTools, ...base.deferred].find((tool) => normalizeToolName(tool.name) === bare);
@@ -221,7 +291,7 @@ const loadTools = (tools: Array<ApiTool>, id: string, found: ReadonlyArray<ApiTo
 };
 
 /** Messages for a case: reminders, context, prior turns with real tool blocks, then the prompt. */
-export const buildMessages = ({ testCase, base, tools }: Sample) => {
+export const buildMessages = ({ testCase, base, tools, world }: Sample) => {
   const messages: Array<ApiMessage> = [];
   const push = (role: ApiMessage["role"], ...blocks: ReadonlyArray<Block>) => {
     const last = messages.at(-1);
@@ -235,7 +305,9 @@ export const buildMessages = ({ testCase, base, tools }: Sample) => {
       : undefined,
     context,
   ];
-  push("user", ...base.reminders, ...notes.flatMap((note) => (note ? [reminder(note)] : [])));
+  const gitStatus = gitStatusReminder(world, valueText(testCase.setup.priorTurns ?? []));
+  const reminders = base.reminders.toSpliced(base.gitStatusAt, 0, text(gitStatus));
+  push("user", ...reminders, ...notes.flatMap((note) => (note ? [reminder(note)] : [])));
   const toolSearch = findTool(base, "ToolSearch")?.name ?? "ToolSearch";
   let nextId = 0;
   for (const turn of priorTurns) {
@@ -255,9 +327,11 @@ export const buildMessages = ({ testCase, base, tools }: Sample) => {
       push("assistant", { type: "tool_use", id, name: toolSearch, input });
       push("user", loadTools(tools, id, unloaded), text(TOOL_LOADED));
     }
-    for (const { id, name, input } of calls)
+    // One call per step, as most real turns run them.
+    for (const { id, name, input, result } of calls) {
       push("assistant", { type: "tool_use", id, name, input });
-    for (const call of calls) push("user", toolResult(call.id, call.result));
+      push("user", toolResult(id, result));
+    }
     if (turn.text) push(turn.role, text(turn.text));
   }
   const { prompt } = testCase;
@@ -277,12 +351,122 @@ const DEFAULT_CAPABILITIES = {
     { providerInstanceId: "codex", models: ["gpt-6-astra", "gpt-6.1-sol"].map(codexModel) },
   ],
 };
-const t3Result = (testCase: McpToolUseCase, name: string, id: string) => {
-  const mock = testCase.setup.mocks?.[name];
-  if (mock !== undefined && mock !== "default") return mock;
-  if (name === "orchestrator_capabilities") return DEFAULT_CAPABILITIES;
-  if (name !== "delegate_task") return { ok: true };
-  return { taskId: `task-${id}`, childThreadId: `thread-${id}`, status: "running" };
+const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
+const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+const DEFAULT_THREAD = {
+  title: "Fix the flaky reconnect test",
+  status: "idle",
+  items: [
+    {
+      position: 1,
+      createdBy: "user",
+      text: "The reconnect test in src/session.test.ts fails about 1 in 10 runs. Fix it.",
+    },
+    {
+      position: 2,
+      createdBy: "assistant",
+      text: "Fixed. The test now waits for the socket close event before it reconnects. 20 runs in a row pass.",
+    },
+  ],
+};
+const HTML_RENDERED =
+  "Shown to the reader above your reply. Don't mention or describe the page; reply with only what it doesn't already say.";
+
+/** Pull request identity from a `url` or `repository` plus `number` input, like T3's results. */
+const pullRequest = (world: World, input: Readonly<Record<string, unknown>>) => {
+  const url = typeof input.url === "string" ? input.url : "";
+  const repository =
+    /github\.com\/([^/]+\/[^/]+)\/pull/.exec(url)?.[1] ?? valueText(input.repository ?? world.repo);
+  const number = Number(/(\d+)\/?$/.exec(url)?.[1] ?? input.number);
+  return {
+    host: "github.com",
+    repository,
+    number,
+    url: url || `https://github.com/${repository}/pull/${number}`,
+  };
+};
+
+/** A believable T3 result for a tool the case does not mock. */
+const t3Default = (sample: Sample, name: string, input: Readonly<Record<string, unknown>>) => {
+  const pr = () => pullRequest(sample.world, input);
+  switch (name) {
+    case "orchestrator_capabilities":
+      return DEFAULT_CAPABILITIES;
+    case "delegate_task": {
+      const n = sample.nextTask++;
+      const target = isRecord(input.target) ? input.target : {};
+      return {
+        taskId: `task-${n}`,
+        childThreadId: uuid(n),
+        childRunId: `run-${n}`,
+        status: "running",
+        workState: "working",
+        hasPendingChildRuns: false,
+        providerInstanceId:
+          target.providerInstanceId ?? DEFAULT_CAPABILITIES.inheritedProviderInstanceId,
+        model: target.model ?? DEFAULT_CAPABILITIES.inheritedModel,
+        summary: null,
+        hasPendingQuestion: false,
+        pendingApproval: null,
+      };
+    }
+    case "task_status":
+      return {
+        taskId: input.taskId,
+        status: "running",
+        workState: "working",
+        hasPendingChildRuns: false,
+        summary: null,
+      };
+    case "task_cancel":
+      return { taskId: input.taskId, status: "cancel_requested" };
+    case "link_pull_request": {
+      const alreadyLinked = sample.linked.has(pr().url);
+      sample.linked.add(pr().url);
+      return { ...pr(), alreadyLinked };
+    }
+    case "unlink_pull_request":
+      return { ...pr(), wasLinked: sample.linked.delete(pr().url) };
+    case "watch_pull_request":
+      sample.linked.add(pr().url);
+      return { ...pr(), watching: true, wasWatching: false };
+    case "unwatch_pull_request":
+      return { ...pr(), watching: false, wasWatching: true };
+    case "list_thread_pull_requests":
+      return {
+        pullRequests: [...sample.linked].map((url) => ({
+          ...pullRequest(sample.world, { url }),
+          source: "agent",
+          watching: false,
+          state: "open",
+        })),
+        chains: [],
+      };
+    case "t3_thread_read": {
+      const threadId = valueText(input.threadId);
+      const { title, status, items } = DEFAULT_THREAD;
+      const link = `[${title}](t3-thread://v1/${PROJECT_ID}/${threadId})`;
+      return { thread: { threadId, title, link, status }, items, nextPosition: 3, hasMore: false };
+    }
+    case "html_preview":
+      return { width: 728, contentHeight: 560, capturedHeight: 560, consoleMessages: [] };
+    case "html_render":
+      return {
+        htmlRender: { attachmentId: "att-1", title: input.title ?? "Visual", height: 560 },
+        message: HTML_RENDERED,
+      };
+    case "preview_status":
+      return {
+        available: false,
+        visible: false,
+        tabId: null,
+        url: null,
+        title: null,
+        loading: false,
+      };
+    default:
+      return { ok: true };
+  }
 };
 
 /** ToolSearch: `select:a,b` loads those tools. Other queries load tools whose name has a word. */
@@ -302,32 +486,53 @@ const searchTools = (base: Base, query: string, max: number) => {
   return found.toSorted((a, b) => hits(b).length - hits(a).length).slice(0, max);
 };
 
-const NATIVE_RESULTS: Readonly<Record<string, string>> = {
-  Agent: "The agent finished. Summary: the task is done and nothing else needs attention.",
-  Bash: "(Bash completed with no output)",
-  Skill: "Skill loaded.",
+const SUBAGENT_WATCH_ERROR =
+  "This thread is a subagent, so it cannot watch pull requests. Its parent thread owns the pull request: finish your task and report back instead.";
+
+/** Result for a native tool the case does not mock. Shell and file tools use the fake world. */
+const nativeResult = (sample: Sample, name: string, input: Readonly<Record<string, unknown>>) => {
+  const shellMocks = sample.testCase.setup.shellMocks ?? [];
+  if (name === "Bash") return runShell(sample.world, shellMocks, valueText(input.command));
+  const file = runFileTool(sample.world, name, input);
+  if (file !== undefined) return file;
+  if (name === "WebFetch")
+    return { text: webPage(sample.world, valueText(input.url)), error: false };
+  const skill = valueText(input.skill);
+  const results: Readonly<Record<string, string>> = {
+    Agent: "The agent finished. Summary: the task is done and nothing else needs attention.",
+    Skill: `Launching skill: ${skill}\n\nBase directory for this skill: ~/.claude/skills/${skill}\n\nThis skill adds no steps for this task. Do it with your usual tools.`,
+    WebSearch: "No results found.",
+  };
+  return { text: results[name] ?? "OK", error: false };
 };
 
 /** Canned result for one tool call. */
-const answerToolCall = ({ testCase, base, tools }: Sample, call: typeof ToolUse.Type) => {
+const answerToolCall = (sample: Sample, call: typeof ToolUse.Type) => {
+  const { testCase, base, tools } = sample;
   const name = normalizeToolName(call.name);
   const input = isRecord(call.input) ? call.input : {};
+  const failed = (error: string): Block => ({ ...toolResult(call.id, error), is_error: true });
   if (!hasTool(tools, call.name)) {
     const error = `InputValidationError: ${call.name} is deferred. Load it with ToolSearch first.`;
-    return { ...toolResult(call.id, `<tool_use_error>${error}</tool_use_error>`), is_error: true };
+    return failed(`<tool_use_error>${error}</tool_use_error>`);
   }
-  if (isT3Name(call.name)) return toolResult(call.id, t3Result(testCase, name, call.id));
   if (name === "ToolSearch") {
     const max = typeof input.max_results === "number" ? input.max_results : 5;
     const found = searchTools(base, valueText(input.query), max);
     if (found.length === 0) return toolResult(call.id, "No matching deferred tools found");
     return loadTools(tools, call.id, found);
   }
-  // The first matching shell mock wins.
-  const command = valueText(input.command);
-  const shell = testCase.setup.shellMocks?.find((mock) => new RegExp(mock.match).test(command));
-  if (name === "Bash" && shell !== undefined) return toolResult(call.id, shell.output);
-  return toolResult(call.id, NATIVE_RESULTS[name] ?? "OK");
+  const mock = testCase.setup.mocks?.[name];
+  if (mock !== undefined && mock !== "default") return toolResult(call.id, mock);
+  if (isT3Name(call.name)) {
+    // T3 refuses a watch from a delegated child.
+    if (name === "watch_pull_request" && testCase.setup.role === "delegated-child") {
+      return failed(SUBAGENT_WATCH_ERROR);
+    }
+    return toolResult(call.id, t3Default(sample, name, input));
+  }
+  const { text: output, error } = nativeResult(sample, name, input);
+  return error ? failed(output) : toolResult(call.id, output);
 };
 
 const BOUND = /^([<>]=)(-?\d+(?:\.\d+)?)$/;
@@ -411,7 +616,10 @@ const requestBody = ({ base, tools }: Sample, effort: string, messages: unknown)
   thinking: { type: "adaptive", display: "summarized" },
   output_config: { effort },
   cache_control: { type: "ephemeral" },
-  system: base.system,
+  // Like Claude Code, cache the shared system prompt so every sample reuses it.
+  system: base.system.map((block, i) =>
+    i === base.system.length - 1 ? { ...block, cache_control: { type: "ephemeral" } } : block,
+  ),
   tools,
   messages,
 });
@@ -450,8 +658,9 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
   config: { readonly apiKey: string; readonly effort: string; readonly maxSteps: number },
   base: Base,
 ) {
-  const sample: Sample = { testCase, base, tools: [...base.nativeTools] };
+  const sample = makeSample(testCase, base);
   const messages = buildMessages(sample);
+  const start = messages.length;
   const calls: Array<Call> = [];
   const said: Array<string> = [];
   const usage: Usage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
@@ -477,7 +686,8 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
     const loaded = results.some((result) => Array.isArray(result.content));
     messages.push({ role: "user", content: [...results, ...(loaded ? [text(TOOL_LOADED)] : [])] });
   }
-  return { calls, text: said.join("\n\n"), stopReason, usage };
+  // The transcript (model turns and tool results) shows what the agent saw when a case fails.
+  return { calls, text: said.join("\n\n"), stopReason, usage, transcript: messages.slice(start) };
 });
 
 type ResultRow = Pick<McpToolUseCase, "id" | "kind" | "pattern"> & {
@@ -531,7 +741,7 @@ const Flags = Schema.Struct({
   cases: Schema.optional(Schema.Array(Schema.String)),
   out: Schema.optional(Schema.String),
   baseline: Schema.optional(Schema.String),
-  case: Schema.optional(Schema.String),
+  case: Schema.optional(Schema.Array(Schema.String)),
   samples: PositiveInt,
   concurrency: PositiveInt,
   "max-steps": PositiveInt,
@@ -555,10 +765,10 @@ const main = Effect.gen(function* () {
       cases: { ...string, multiple: true },
       out: string,
       baseline: string,
-      case: string,
+      case: { ...string, multiple: true },
       samples: { ...string, default: "3" },
       concurrency: { ...string, default: "4" },
-      "max-steps": { ...string, default: "8" },
+      "max-steps": { ...string, default: "10" },
       effort: { ...string, default: "high" },
       // T3's text must work for every user, so the captured CLAUDE.md is dropped by default.
       "user-instructions": { ...string, default: "drop" },
@@ -577,7 +787,8 @@ const main = Effect.gen(function* () {
     flags.cases === undefined
       ? mcpToolUseEvaluationCases
       : (yield* Effect.forEach(flags.cases, (file) => readJsonl(file, decodeCase))).flat();
-  const selected = cases.filter(({ id }) => flags.case === undefined || id === flags.case);
+  const wanted = flags.case?.flatMap((ids) => ids.split(","));
+  const selected = cases.filter(({ id }) => wanted === undefined || wanted.includes(id));
   if (selected.length === 0) return yield* Effect.die(new Error("No case matches --case."));
   const capture = yield* fs.readFileString(flags.template).pipe(Effect.flatMap(decodeCapture));
   const keepUserInstructions = flags["user-instructions"] === "keep";
@@ -585,7 +796,7 @@ const main = Effect.gen(function* () {
   if (flags["dry-run"]) {
     // One JSON line per case. Without --case this also checks that every case builds.
     for (const testCase of selected) {
-      const sample: Sample = { testCase, base, tools: [...base.nativeTools] };
+      const sample = makeSample(testCase, base);
       const body = requestBody(sample, flags.effort, buildMessages(sample));
       process.stdout.write(`${yield* encodeJson(body)}\n`);
     }
