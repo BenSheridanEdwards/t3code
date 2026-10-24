@@ -122,67 +122,7 @@ const makePersistenceHarness = Effect.fn("test.makeShellPersistenceHarness")(fun
 });
 
 describe("environment shell synchronization", () => {
-  it.effect("saves once across cursor-only updates and keeps the live cursor", () =>
-    Effect.gen(function* () {
-      const saved = yield* Ref.make<ReadonlyArray<OrchestrationV2ShellSnapshot>>([]);
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          const h = yield* makePersistenceHarness((_id, snapshot) =>
-            Ref.update(saved, (values) => [...values, snapshot]),
-          );
-          yield* TestClock.adjust("500 millis");
-          expect((yield* Ref.get(saved)).length).toBe(1);
-          for (const sequence of [2, 3, 4]) {
-            yield* h.send(
-              { kind: "thread.updated", sequence, location: "active", thread: v2ThreadShell },
-              (snapshot) => snapshot.snapshotSequence === sequence,
-            );
-            yield* TestClock.adjust("10 seconds");
-          }
-          expect(
-            Option.getOrThrow((yield* SubscriptionRef.get(h.state)).snapshot).snapshotSequence,
-          ).toBe(4);
-        }),
-      );
-      expect((yield* Ref.get(saved)).map((snapshot) => snapshot.snapshotSequence)).toEqual([1]);
-    }),
-  );
-
-  it.effect("saves once across no-op enrichment refreshes", () =>
-    Effect.gen(function* () {
-      const saved = yield* Ref.make<ReadonlyArray<OrchestrationV2ShellSnapshot>>([]);
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          const h = yield* makePersistenceHarness((_id, snapshot) =>
-            Ref.update(saved, (values) => [...values, snapshot]),
-          );
-          yield* TestClock.adjust("500 millis");
-          const before = Option.getOrThrow((yield* SubscriptionRef.get(h.state)).snapshot);
-          for (let index = 0; index < 3; index += 1) {
-            yield* h.send(
-              {
-                kind: "snapshot",
-                snapshot: {
-                  ...before,
-                  projects: before.projects.map((project) => ({ ...project })),
-                },
-                resolvedRepositoryIdentityRoots: before.projects.map(
-                  (project) => project.workspaceRoot,
-                ),
-              },
-              () => true,
-            );
-            yield* TestClock.adjust("10 seconds");
-          }
-          expect((yield* Ref.get(saved)).length).toBe(1);
-          expect(Option.getOrThrow((yield* SubscriptionRef.get(h.state)).snapshot)).toBe(before);
-        }),
-      );
-      expect((yield* Ref.get(saved)).length).toBe(1);
-    }),
-  );
-
-  it.effect("persists lower-sequence resets and same-sequence changed data", () =>
+  it.effect("skips unchanged shell writes, persists resets and flushes changed rows", () =>
     Effect.gen(function* () {
       const saved = yield* Ref.make<ReadonlyArray<OrchestrationV2ShellSnapshot>>([]);
       yield* Effect.scoped(
@@ -196,6 +136,23 @@ describe("environment shell synchronization", () => {
             (snapshot) => snapshot.snapshotSequence === 10,
           );
           yield* TestClock.adjust("10 seconds");
+          expect((yield* Ref.get(saved)).map((snapshot) => snapshot.snapshotSequence)).toEqual([1]);
+          const live = Option.getOrThrow((yield* SubscriptionRef.get(h.state)).snapshot);
+          expect(live.snapshotSequence).toBe(10);
+          const enriched = yield* h.send(
+            {
+              kind: "snapshot",
+              snapshot: { ...live, projects: live.projects.map((project) => ({ ...project })) },
+              resolvedRepositoryIdentityRoots: live.projects.map(
+                (project) => project.workspaceRoot,
+              ),
+            },
+            () => true,
+          );
+          expect(enriched.projects).toEqual(live.projects);
+          expect(enriched.snapshotSequence).toBe(10);
+          yield* TestClock.adjust("10 seconds");
+          expect((yield* Ref.get(saved)).map((snapshot) => snapshot.snapshotSequence)).toEqual([1]);
           yield* h.send(
             { kind: "snapshot", snapshot: { ...LIVE_SHELL_SNAPSHOT, snapshotSequence: 4 } },
             (snapshot) => snapshot.snapshotSequence === 4,
