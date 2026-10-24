@@ -358,6 +358,41 @@ export interface ServerConfigSubscriptionOptions {
   readonly usageLimitsCommand?: boolean;
 }
 
+// Configs are JSON-shaped. Missing and undefined object fields persist identically.
+function sameCacheValue(previous: unknown, next: unknown): boolean {
+  if (previous === next) return true;
+  if (
+    previous === null ||
+    next === null ||
+    typeof previous !== "object" ||
+    typeof next !== "object"
+  ) {
+    return false;
+  }
+  if (Array.isArray(previous) || Array.isArray(next)) {
+    if (!Array.isArray(previous) || !Array.isArray(next) || previous.length !== next.length) {
+      return false;
+    }
+    for (let index = 0; index < previous.length; index += 1) {
+      if (!sameCacheValue(previous[index], next[index])) return false;
+    }
+    return true;
+  }
+  if (
+    Object.getPrototypeOf(previous) !== Object.prototype ||
+    Object.getPrototypeOf(next) !== Object.prototype
+  ) {
+    return false;
+  }
+  const before = previous as Record<string, unknown>;
+  const after = next as Record<string, unknown>;
+  return (
+    Object.keys(before).every((key) =>
+      sameCacheValue(before[key], Object.hasOwn(after, key) ? after[key] : undefined),
+    ) && Object.keys(after).every((key) => Object.hasOwn(before, key) || after[key] === undefined)
+  );
+}
+
 export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConfigState.make")(
   function* (subscription: ServerConfigSubscriptionOptions) {
     const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
@@ -395,15 +430,7 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
         lastEventLoopStall: _stall,
         ...cacheable
       } = config;
-      const previous = lastPersisted;
-      if (
-        previous !== undefined &&
-        Object.keys(previous).length === Object.keys(cacheable).length &&
-        Object.entries(cacheable).every(
-          ([key, value]) =>
-            Object.hasOwn(previous, key) && previous[key as keyof ServerConfig] === value,
-        )
-      ) {
+      if (lastPersisted !== undefined && sameCacheValue(lastPersisted, cacheable)) {
         return true;
       }
       const saved = yield* cache.saveServerConfig(environmentId, cacheable).pipe(

@@ -96,8 +96,8 @@ export function applyServerConfigProjection(
       return Option.map(current, (projection) => ({
         config: {
           ...projection.config,
-          keybindings: reuseUnchanged(projection.config.keybindings, event.payload.keybindings),
-          issues: reuseUnchanged(projection.config.issues, event.payload.issues),
+          keybindings: event.payload.keybindings,
+          issues: event.payload.issues,
         },
         latestEvent: event,
         source: "live",
