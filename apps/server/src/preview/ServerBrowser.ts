@@ -2260,19 +2260,22 @@ const make = Effect.gen(function* () {
       capacity: VIEWER_OUTPUT_LIMIT,
       strategy: "dropping",
     });
+    // A queued restart checks this after its own stop, so it cannot land after the final one.
+    let closed = false;
     const session = yield* Effect.acquireRelease(
       Effect.tryPromise({
         try: () => tab.page.context().newCDPSession(tab.page),
         catch: (cause) => new ServerBrowserLaunchError({ cause }),
       }),
       (session) =>
-        Effect.promise(() =>
-          session
+        Effect.promise(() => {
+          closed = true;
+          return session
             .send("Page.stopScreencast")
             .catch(constVoid)
             .then(() => session.detach())
-            .catch(constVoid),
-        ),
+            .catch(constVoid);
+        }),
     );
     const quality = Math.min(100, Math.max(1, Math.round(input.quality)));
     // Chromium may drop the final frame during a burst; send a still when it settles.
@@ -2285,8 +2288,9 @@ const make = Effect.gen(function* () {
     const startScreencast = (scale: number) => {
       screencastScale = scale;
       screencastParams = screencastParams.then(async () => {
-        if (tab.capturing > 0) return;
+        if (closed || tab.capturing > 0) return;
         await session.send("Page.stopScreencast").catch(constVoid);
+        if (closed) return;
         await session
           .send("Page.startScreencast", {
             format: "jpeg",

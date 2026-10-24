@@ -16,6 +16,7 @@ import {
   type PreviewAutomationStatus,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -23,6 +24,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import type { BrowserContext, Page } from "playwright-core";
 import { beforeEach, expect, vi } from "vite-plus/test";
@@ -670,6 +672,56 @@ it.live(
     ).pipe(Effect.provide(layer)),
 );
 
+it.live("a closing viewer cannot restart its screencast after the final stop", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const viewerScope = yield* Scope.make();
+      const viewer = yield* browser
+        .attachViewer(viewerInput(tabId, true))
+        .pipe(Scope.provide(viewerScope));
+      yield* viewer.input({ type: "takeControl" });
+      yield* viewer.input({ type: "wheel", x: 1, y: 1, deltaX: 0, deltaY: 10 });
+      const session = contexts[0]!.sessions.at(-1)!;
+      const send = session.send.getMockImplementation()!;
+      const calls: Array<string> = [];
+      const motionStop = Promise.withResolvers<void>();
+      const motionStopped = Promise.withResolvers<Record<string, unknown>>();
+      const finalStop = Promise.withResolvers<void>();
+      session.send.mockImplementation(async (method, input) => {
+        calls.push(method);
+        if (method !== "Page.stopScreencast") return send(method, input);
+        if (calls.length > 1) {
+          finalStop.resolve();
+          return send(method, input);
+        }
+        motionStop.resolve();
+        return motionStopped.promise;
+      });
+      session.detach.mockImplementation(async () => {
+        calls.push("detach");
+      });
+      const onFrame = session.on.mock.calls.find(([name]) => name === "Page.screencastFrame")![1];
+      for (let sessionId = 0; sessionId < 4; sessionId++) {
+        (onFrame as (frame: unknown) => void)({ data: "ZnJhbWU=", sessionId });
+      }
+      // The motion restart is stuck in its stop while the viewer closes.
+      yield* Effect.promise(() => motionStop.promise);
+      const closing = yield* Scope.close(viewerScope, Exit.void).pipe(Effect.forkScoped);
+      yield* Effect.promise(() => finalStop.promise);
+      motionStopped.resolve({});
+      yield* Fiber.join(closing);
+      expect(calls.at(-1)).toBe("detach");
+      expect(calls.slice(calls.lastIndexOf("Page.stopScreencast"))).toEqual([
+        "Page.stopScreencast",
+        "detach",
+      ]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+// Focus emulation keeps a hidden guest unthrottled, so a desktop tab gets it only
+// for the length of an agent operation, including one the page makes fail.
 it.live("reports a pending dialog without evaluating the page and resolves it explicitly", () =>
   Effect.scoped(
     Effect.gen(function* () {
