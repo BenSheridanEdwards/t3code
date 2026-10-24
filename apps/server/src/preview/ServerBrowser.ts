@@ -2008,12 +2008,17 @@ const make = Effect.gen(function* () {
         return { tabId: tab.tabId, colorScheme };
       }
       case "snapshot": {
-        return withScreencastsPaused(tab, () =>
-          ServerBrowserPage.snapshot({
-            ...tab,
-            renderScale: tab.desktop ? "display" : RENDER_SCALE,
-          }),
-        );
+        const releaseFocus = await holdDesktopFocus(tab);
+        try {
+          return await withScreencastsPaused(tab, () =>
+            ServerBrowserPage.snapshot({
+              ...tab,
+              renderScale: tab.desktop ? "display" : RENDER_SCALE,
+            }),
+          );
+        } finally {
+          await releaseFocus();
+        }
       }
       case "click": {
         const clickInput = input as PreviewAutomationClickInput;

@@ -770,6 +770,70 @@ it.live("a desktop tab is held focused only by agent operations and viewers", ()
   ).pipe(Effect.provide(layer)),
 );
 
+it.live.each([false, true])(
+  "an observer snapshot holds desktop focus through capture and releases it (failure: %s)",
+  (captureFails) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const broker = yield* Broker.PreviewAutomationBroker;
+        const manager = yield* Manager.PreviewManager;
+        const browser = yield* ServerBrowser.ServerBrowser;
+        yield* Effect.yieldNow;
+        desktopRendersNext = true;
+        const opened = yield* manager.open({ threadId: scope.thread.threadId, runtime: "server" });
+        const tabId = PreviewTabId.make(opened.tabId);
+        yield* browser.attachViewer(viewerInput(tabId, true));
+        const observer = asSession("observer");
+        const before = yield* broker.invoke<PreviewAutomationStatus>({
+          scope: observer,
+          tabId,
+          operation: "status",
+          input: {},
+        });
+        expect(before.control).toMatchObject({ owner: "human", ownedByCaller: false });
+        desktopFocus.length = 0;
+        desktopFocusHolders.length = 0;
+        for (const session of desktopConnections[0]!.context.sessions) {
+          const send = session.send.getMockImplementation()!;
+          session.send.mockImplementation(async (method, input) => {
+            if (
+              method === "Page.captureScreenshot" &&
+              (input as { format?: string }).format === "png"
+            ) {
+              desktopFocus.push("capture");
+              expect(desktopFocus[0]).toBe("focus:true");
+              expect(desktopFocus).not.toContain("focus:false");
+              if (captureFails) throw new Error("Capture failed.");
+            }
+            return send(method, input);
+          });
+        }
+        const result = yield* broker
+          .invoke<PreviewAutomationSnapshot>({
+            scope: observer,
+            tabId,
+            operation: "snapshot",
+            input: {},
+          })
+          .pipe(Effect.exit);
+        expect(Exit.isFailure(result)).toBe(captureFails);
+        expect(desktopFocus).toEqual(
+          captureFails
+            ? ["focus:true", "capture", "capture", "focus:false"]
+            : ["focus:true", "capture", "focus:false"],
+        );
+        expect(new Set(desktopFocusHolders).size).toBe(1);
+        const after = yield* broker.invoke<PreviewAutomationStatus>({
+          scope: observer,
+          tabId,
+          operation: "status",
+          input: {},
+        });
+        expect(after.control).toEqual(before.control);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
 // The page initializes after a commit-readiness navigate responds, so it keeps focus until load.
 it.live("a navigation that responds at commit holds focus until the page loads", () =>
   Effect.scoped(
