@@ -1,5 +1,5 @@
 import type { NativeStackHeaderItem } from "@react-navigation/native-stack";
-import { act, createContext, type ReactElement } from "react";
+import { act, createContext, startTransition, Suspense, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 
@@ -167,4 +167,69 @@ it("applies a custom header element rendered inside a navigation container", () 
 
   renderConnecting("Reconnecting");
   expect(renderedCustomLabel()).toBe("Reconnecting");
+});
+
+it("keeps committed handlers while a replacement render suspends", () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  root = createRoot(document.createElement("div"));
+  const onPress = vi.fn();
+  const pending = new Promise<never>(() => {});
+  function Suspend(): never {
+    throw pending;
+  }
+  const toolbar = (value: string, suspend = false) => (
+    <Suspense fallback={null}>
+      <NativeHeaderToolbar>
+        <NativeHeaderToolbar.Button label="Open" onPress={() => onPress(value)} />
+      </NativeHeaderToolbar>
+      {suspend && <Suspend />}
+    </Suspense>
+  );
+  act(() => root!.render(toolbar("committed")));
+  const button = harness.renderedItems[0];
+  if (button?.type !== "button") throw new Error("Expected the native button");
+
+  act(() => startTransition(() => root!.render(toolbar("pending", true))));
+  button.onPress?.();
+  expect(onPress.mock.calls).toEqual([["committed"]]);
+
+  act(() => root!.render(toolbar("replacement")));
+  button.onPress?.();
+  expect(onPress.mock.calls).toEqual([["committed"], ["replacement"]]);
+});
+
+it("isolates toolbar handlers and ignores retained actions after their toolbar unmounts", () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  root = createRoot(document.createElement("div"));
+  const onPress = vi.fn();
+  const toolbar = (id: string, value: string) => (
+    <NativeHeaderToolbar key={id}>
+      <NativeHeaderToolbar.Button label={id} onPress={() => onPress(id, value)} />
+    </NativeHeaderToolbar>
+  );
+  act(() => root!.render([toolbar("first", "initial")]));
+  const first = harness.renderedItems[0];
+  if (first?.type !== "button") throw new Error("Expected the first native button");
+  act(() => root!.render([toolbar("first", "initial"), toolbar("second", "initial")]));
+  const second = harness.renderedItems[0];
+  if (second?.type !== "button") throw new Error("Expected the second native button");
+
+  act(() => root!.render([toolbar("first", "updated"), toolbar("second", "updated")]));
+  first.onPress?.();
+  second.onPress?.();
+  expect(onPress.mock.calls).toEqual([
+    ["first", "updated"],
+    ["second", "updated"],
+  ]);
+
+  onPress.mockClear();
+  act(() => root!.render([toolbar("second", "remaining")]));
+  first.onPress?.();
+  second.onPress?.();
+  expect(onPress.mock.calls).toEqual([["second", "remaining"]]);
+
+  onPress.mockClear();
+  act(() => root!.render(null));
+  second.onPress?.();
+  expect(onPress).not.toHaveBeenCalled();
 });

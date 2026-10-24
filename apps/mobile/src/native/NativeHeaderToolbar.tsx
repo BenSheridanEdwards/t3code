@@ -8,7 +8,6 @@ import type {
 import {
   Children,
   isValidElement,
-  useCallback,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -67,6 +66,8 @@ function iconFromProp(icon: unknown): NativeStackHeaderIcon | undefined {
   return undefined;
 }
 
+type RegisterHandler = (handler: unknown) => () => void;
+
 type ToolbarElementProps = Record<string, unknown> & { readonly children?: ReactNode };
 
 function elementTypeName(element: ReactElement): string | undefined {
@@ -79,6 +80,7 @@ function elementTypeName(element: ReactElement): string | undefined {
 
 function convertMenuAction(
   element: ReactElement<ToolbarElementProps>,
+  register: RegisterHandler,
 ): NativeStackHeaderItemMenu["menu"]["items"][number] | null {
   const typeName = elementTypeName(element);
   if (typeName === "NativeHeaderToolbarMenuAction") {
@@ -89,10 +91,7 @@ function convertMenuAction(
       description: typeof element.props.subtitle === "string" ? element.props.subtitle : undefined,
       disabled: Boolean(element.props.disabled),
       icon: iconFromProp(element.props.icon),
-      onPress:
-        typeof element.props.onPress === "function"
-          ? (element.props.onPress as () => void)
-          : () => undefined,
+      onPress: register(element.props.onPress),
       state: element.props.isOn === true ? "on" : undefined,
       destructive: Boolean(element.props.destructive),
       discoverabilityLabel:
@@ -111,30 +110,36 @@ function convertMenuAction(
           : labelFromChildren(element.props.children),
       icon: iconFromProp(element.props.icon),
       inline: Boolean(element.props.inline),
-      items: collectMenuItems(element.props.children),
+      items: collectMenuItems(element.props.children, register),
     };
   }
 
   return null;
 }
 
-function collectMenuItems(children: ReactNode): NativeStackHeaderItemMenu["menu"]["items"] {
+function collectMenuItems(
+  children: ReactNode,
+  register: RegisterHandler,
+): NativeStackHeaderItemMenu["menu"]["items"] {
   const items: NativeStackHeaderItemMenu["menu"]["items"] = [];
   Children.forEach(children, (child) => {
     if (!isValidElement<ToolbarElementProps>(child)) {
       return;
     }
-    const item = convertMenuAction(child);
+    const item = convertMenuAction(child, register);
     if (item) {
       items.push(item);
       return;
     }
-    items.push(...collectMenuItems(child.props.children));
+    items.push(...collectMenuItems(child.props.children, register));
   });
   return items;
 }
 
-function convertToolbarChild(child: ReactNode): NativeToolbarItem | null {
+function convertToolbarChild(
+  child: ReactNode,
+  register: RegisterHandler,
+): NativeToolbarItem | null {
   if (!isValidElement<ToolbarElementProps>(child)) {
     return null;
   }
@@ -161,10 +166,7 @@ function convertToolbarChild(child: ReactNode): NativeToolbarItem | null {
       axisBehavior: child.props.axisBehavior as NativeStackHeaderAxisBehavior,
       disabled: Boolean(child.props.disabled),
       icon: iconFromProp(child.props.icon),
-      onPress:
-        typeof child.props.onPress === "function"
-          ? (child.props.onPress as () => void)
-          : () => undefined,
+      onPress: register(child.props.onPress),
       sharesBackground: !child.props.separateBackground,
       tintColor: child.props.tintColor as ColorValue | undefined,
       variant:
@@ -189,7 +191,7 @@ function convertToolbarChild(child: ReactNode): NativeToolbarItem | null {
       icon: iconFromProp(child.props.icon),
       menu: {
         title: typeof child.props.title === "string" ? child.props.title : undefined,
-        items: collectMenuItems(child.props.children),
+        items: collectMenuItems(child.props.children, register),
       },
       sharesBackground: !child.props.separateBackground,
       tintColor: child.props.tintColor as ColorValue | undefined,
@@ -212,10 +214,10 @@ function convertToolbarChild(child: ReactNode): NativeToolbarItem | null {
   return null;
 }
 
-function collectToolbarItems(children: ReactNode): NativeToolbarItem[] {
+function collectToolbarItems(children: ReactNode, register: RegisterHandler): NativeToolbarItem[] {
   const items: NativeToolbarItem[] = [];
   Children.forEach(children, (child) => {
-    const item = convertToolbarChild(child);
+    const item = convertToolbarChild(child, register);
     if (item) {
       if (item.type === "spacing") {
         // Native inserts spacing items at `index`, treating a missing index
@@ -228,34 +230,6 @@ function collectToolbarItems(children: ReactNode): NativeToolbarItem[] {
   return items;
 }
 
-function stabilizeItemCallbacks<
-  T extends NativeToolbarItem | NativeStackHeaderItemMenu["menu"]["items"][number],
->(item: T, path: string, register: (path: string, handler: () => void) => () => void): T {
-  if (item.type === "button" || item.type === "action") {
-    return { ...item, onPress: register(path, item.onPress) };
-  }
-  if (item.type === "menu") {
-    return {
-      ...item,
-      menu: {
-        ...item.menu,
-        items: item.menu.items.map((child, index) =>
-          stabilizeItemCallbacks(child, `${path}.${index}`, register),
-        ),
-      },
-    };
-  }
-  if (item.type === "submenu") {
-    return {
-      ...item,
-      items: item.items.map((child, index) =>
-        stabilizeItemCallbacks(child, `${path}.${index}`, register),
-      ),
-    };
-  }
-  return item;
-}
-
 function NativeHeaderToolbarRoot(props: {
   readonly placement?: "left" | "right" | "bottom";
   readonly children?: ReactNode;
@@ -264,24 +238,24 @@ function NativeHeaderToolbarRoot(props: {
   const route = useRoute();
   const tabActivity = use(NativeWorkspaceTabActivityContext);
   const isTabActive = tabActivity?.isActive;
-  const committedHandlers = useRef(new Map<string, () => void>());
-  const dispatch = useCallback((path: string) => committedHandlers.current.get(path)?.(), []);
+  const committedHandlers = useRef<(() => void)[]>([]);
   const { items, handlers } = useMemo(() => {
-    const handlers = new Map<string, () => void>();
-    const register = (path: string, handler: () => void) => {
-      handlers.set(path, handler);
-      return () => dispatch(path);
+    const handlers: (() => void)[] = [];
+    const register: RegisterHandler = (handler) => {
+      const index = handlers.length;
+      handlers.push(typeof handler === "function" ? (handler as () => void) : () => undefined);
+      return () => committedHandlers.current[index]?.();
     };
-    const items = collectToolbarItems(props.children).map((item, index) =>
-      stabilizeItemCallbacks(item, String(index), register),
-    );
-    return { items, handlers };
-  }, [props.children, dispatch]);
-  // Native actions outlive their render when screen options dedupe unchanged presentation.
-  // Publish handlers on every commit, even when the native item factories never run again.
+    return { items: collectToolbarItems(props.children, register), handlers };
+  }, [props.children, committedHandlers]);
+  // Native retains actions when unchanged presentation skips re-registration.
+  // Publish only committed handlers; abandoned renders must not replace them.
   useLayoutEffect(() => {
     committedHandlers.current = handlers;
-  });
+    return () => {
+      committedHandlers.current = [];
+    };
+  }, [handlers, committedHandlers]);
   // UIKit's search placement item belongs to the toolbar, never a header group.
   const headerItems = useMemo(
     () => items.filter((item): item is NativeStackHeaderItem => item.type !== "searchBarPlacement"),
