@@ -1,19 +1,67 @@
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 
 import {
   buildBase,
   buildMessages,
   failedEarly,
+  executeCodex,
   gradeSample,
   makeSample,
   type McpToolUseCase,
   mockOutput,
+  normalizeToolInput,
+  normalizeToolName,
   type SampleRun,
   shellOutput,
   shellRequest,
   t3SystemAppend,
 } from "./evaluate-mcp-tool-use.ts";
 import { taskPrompt } from "../src/mcp/OrchestratorMcpService.ts";
+
+it("grades Codex shell and subagent calls with the shared rules", () => {
+  const calls = [
+    { name: "exec_command", input: { cmd: "sleep 60" } },
+    { name: "collaboration.spawn_agent", input: { task: "review" } },
+    { name: "mcp__t3_code__delegate_task", input: {} },
+  ].map(({ name, input }) => ({
+    step: 0,
+    tool: normalizeToolName(name),
+    input: normalizeToolInput(name, input),
+  }));
+  assert.deepEqual(
+    calls.map((c) => c.tool),
+    ["Bash", "Agent", "delegate_task"],
+  );
+  assert.deepEqual(
+    failed(
+      {
+        calls: [{ tool: "Bash", args: { command: "~sleep" } }],
+        notCalls: ["Agent"],
+        shellMustNot: ["sleep"],
+      },
+      { calls, text: "", stopReason: "end_turn" },
+    ),
+    ["notCalls Agent", "shellMustNot /sleep/"],
+  );
+});
+
+it("runs code-mode calls without exposing host capabilities, including after await", async () => {
+  const catalog = [{ name: "mock", description: "mock" }];
+  const result = await executeCodex(
+    "text((await tools.mock({n: 2})).n); text([typeof process, typeof require, typeof fetch]);",
+    catalog,
+    async (_, input) => input,
+  );
+  assert.include(result, "2\n");
+  assert.include(result, '["undefined","undefined","undefined"]');
+  assert.include(
+    await executeCodex('text.constructor("return process")()', catalog, async () => null),
+    "Code generation from strings disallowed",
+  );
+  await expect(
+    executeCodex("await tools.mock({}); while (true) {}", catalog, async () => null),
+  ).rejects.toThrow("Script execution timed out");
+});
 
 const failed = (expect: Parameters<typeof gradeSample>[0], run: SampleRun) =>
   gradeSample(expect, run)

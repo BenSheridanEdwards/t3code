@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off
 /**
- * Replays small fake threads against Claude Sonnet 5.5 to check how agents use T3 Code's MCP
- * tools. A captured Claude Code request supplies the system prompt, reminders, and native tools.
+ * Replays small fake threads against Claude Sonnet 5.5 or GPT-6.1 Sol to check T3 Code's MCP
+ * tools. A captured harness request supplies the system prompt, reminders, and native tools.
  * T3's instructions, tool schemas, and delegated task prompt come from this checkout, so running
  * two branches A/B tests an instruction rewrite. Shell, file, and web tools are answered by a
  * cheap model that plays the machine; nothing runs on the host.
@@ -11,9 +11,12 @@
  *
  *   node scripts/evaluate-mcp-tool-use.ts --template <capture.json> --out <dir> [--cases <file.jsonl>]...
  *   node scripts/evaluate-mcp-tool-use.ts --template <capture.json> --dry-run [--case <id>[,<id>]]
+ *   node scripts/evaluate-mcp-tool-use.ts --model gpt-6.1-sol --out <dir>
  */
 import * as NodeChildProcess from "node:child_process";
+import * as NodeOS from "node:os";
 import * as NodeUtil from "node:util";
+import * as NodeVM from "node:vm";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { OrchestratorMcpTaskRole, ProviderInstanceId } from "@t3tools/contracts";
@@ -26,9 +29,13 @@ import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import { Tool } from "effect/ai";
-import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import { taskPrompt } from "../src/mcp/OrchestratorMcpService.ts";
+import {
+  buildCodexAdditionalContext,
+  buildCodexDeveloperInstructions,
+} from "../src/provider/CodexDeveloperInstructions.ts";
 import { AttachmentToolkit } from "../src/mcp/toolkits/attachment/tools.ts";
 import { DeviceToolkit } from "../src/mcp/toolkits/device/tools.ts";
 import { EnvironmentToolkit } from "../src/mcp/toolkits/environment/tools.ts";
@@ -45,6 +52,8 @@ import {
   makeClaudeQueryOptions,
 } from "../src/orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 const MODEL = "claude-sonnet-5-5";
+const SOL = "gpt-6.1-sol";
+type Model = typeof MODEL | typeof SOL;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 // USD per million tokens. Cache writes use the 5-minute rate.
 const PRICES = {
@@ -182,6 +191,16 @@ const MessagesRequest = Schema.Struct({
 });
 // A CLIProxyAPI capture keeps the Anthropic body at request.provider_native.
 const Capture = Schema.Struct({ request: Schema.Struct({ provider_native: MessagesRequest }) });
+const ResponsesRequest = Schema.StructWithRest(
+  Schema.Struct({
+    input: Schema.Array(AnyBlock),
+    reasoning: Schema.StructWithRest(Schema.Struct({ effort: Schema.String }), Rest),
+  }),
+  Rest,
+);
+const CodexCapture = Schema.Struct({
+  request: Schema.Struct({ provider_native: ResponsesRequest }),
+});
 const ToolUse = Schema.Struct({
   type: Schema.Literal("tool_use"),
   id: Schema.String,
@@ -228,8 +247,27 @@ const hasTool = (tools: ReadonlyArray<ApiTool>, name: string) =>
   tools.some((tool) => tool.name === name);
 
 /** Grading name: T3 tools lose their MCP prefix, native tools keep the part after the last `_`. */
-const normalizeToolName = (name: string) =>
-  isT3Name(name) ? name.slice(T3_PREFIX.length) : name.slice(name.lastIndexOf("_") + 1);
+const CODEX_NAMES: Readonly<Record<string, string>> = {
+  exec_command: "Bash",
+  shell_command: "Bash",
+  shell: "Bash",
+  spawn_agent: "Agent",
+  apply_patch: "Edit",
+  write_stdin: "write_stdin",
+  web__run: "WebFetch",
+};
+export const normalizeToolName = (name: string) => {
+  const bare = name.slice(name.lastIndexOf(".") + 1);
+  return isT3Name(bare)
+    ? bare.slice(T3_PREFIX.length)
+    : (CODEX_NAMES[bare] ?? bare.slice(bare.lastIndexOf("_") + 1));
+};
+export const normalizeToolInput = (name: string, input: unknown) =>
+  normalizeToolName(name) === "Bash" && isRecord(input)
+    ? { ...input, command: input.command ?? input.cmd }
+    : typeof input === "string" && normalizeToolName(name) === "Edit"
+      ? { patch: input }
+      : input;
 
 // McpHttpServer advertises each tool's JSON schema, and Claude Code passes the MCP name,
 // description, and schema through unchanged.
@@ -273,12 +311,12 @@ export const t3SystemAppend = () => {
  * descriptions and schemas (loaded on demand here, sent up front by harnesses without
  * deferred tools). Tokens are estimated at 4 characters each.
  */
-const t3ContextReport = () => {
+const t3ContextReport = (model: Model = MODEL) => {
   const size = (chars: number) => `${chars} chars (~${Math.round(chars / 4)} tokens)`;
   const descriptions = t3Tools.reduce((sum, tool) => sum + valueText(tool.description).length, 0);
   const schemas = JSON.stringify(t3Tools).length;
   return [
-    `- T3 context: system text ${size(t3SystemAppend().length)}`,
+    `- T3 context: system text ${size((model === SOL ? JSON.stringify(buildCodexAdditionalContext({ model: SOL }, { browser: true, device: true })) : t3SystemAppend()).length)}`,
     `tool descriptions ${size(descriptions)}`,
     `full tool schemas ${size(schemas)} across ${t3Tools.length} tools.`,
   ].join(", ");
@@ -371,7 +409,121 @@ export const buildBase = (
   };
 };
 
-type Base = ReturnType<typeof buildBase>;
+type Base = ReturnType<typeof buildBase> & { readonly codex?: typeof ResponsesRequest.Type };
+
+/** Keep the captured harness prompt and tools; replace app-owned context and the real user. */
+const buildCodexBase = (
+  template: typeof ResponsesRequest.Type,
+  options: {
+    readonly keepUserInstructions: boolean;
+    readonly effort?: string | undefined;
+  },
+): Base => {
+  const contentText = (item: Block) =>
+    Array.isArray(item.content)
+      ? item.content.map((block: Block) => valueText(block.text)).join("\n")
+      : valueText(item.content);
+  const joined = template.input.map(contentText).join("\n");
+  if (!joined.includes("<t3_code_runtime>"))
+    throw new Error("Codex template needs full T3 context.");
+  const cwd = /<cwd>(.*?)<\/cwd>/.exec(joined)?.[1] ?? "/home/user/app";
+  const home = /^\/(?:home|Users)\/[^/]+/.exec(cwd)?.[0];
+  const clean = (s: string) => (home ? s.replaceAll(home, home.replace(/[^/]+$/, "user")) : s);
+  const effort = options.effort ?? template.reasoning.effort;
+  const message = (value: string, role = "developer") => ({
+    type: "message",
+    role,
+    content: [{ type: "input_text", text: value }],
+  });
+  const input = template.input.flatMap((item) => {
+    const content = contentText(item);
+    if (content.includes("<t3_code_")) return [];
+    if (item.role === "user") {
+      const env = /<environment_context>[\s\S]*?<\/environment_context>/.exec(content)?.[0];
+      return env ? [message(clean(options.keepUserInstructions ? content : env), "user")] : [];
+    }
+    if (content.includes("<collaboration_mode>"))
+      return [message(buildCodexDeveloperInstructions("default"))];
+    return [JSON.parse(clean(JSON.stringify(item))) as Block];
+  });
+  const context = buildCodexAdditionalContext(
+    { model: SOL, reasoningEffort: effort },
+    { browser: true, device: true },
+  );
+  input.push(
+    ...Object.entries(context).map(([key, entry]) => message(`<${key}>${entry.value}</${key}>`)),
+  );
+  const nativeTools = input
+    .flatMap((item) =>
+      item.type === "additional_tools" && Array.isArray(item.tools)
+        ? item.tools.flatMap((ns: unknown) =>
+            isRecord(ns) && Array.isArray(ns.tools) ? ns.tools : [],
+          )
+        : [],
+    )
+    .filter((tool): tool is ApiTool => isRecord(tool) && typeof tool.name === "string");
+  if (!nativeTools.some((tool) => tool.name === "exec"))
+    throw new Error("Codex template needs code-mode exec.");
+  return {
+    system: [],
+    reminders: [],
+    gitStatusAt: 0,
+    environment: {
+      cwd: clean(cwd),
+      platform: cwd.startsWith("/Users/") ? "darwin" : "linux",
+      date: /<current_date>(.*?)<\/current_date>/.exec(joined)?.[1],
+    },
+    nativeTools,
+    deferred: [...t3Tools],
+    codex: { ...template, input, reasoning: { ...template.reasoning, effort } },
+  };
+};
+
+/** Replay prior calls in Codex's wire format, including Claude-shaped file operations. */
+const codexCall = (name: string, input: unknown) => {
+  const args = isRecord(input) ? input : {};
+  if (name === "Bash")
+    return `text(await tools.exec_command(${JSON.stringify({ ...args, cmd: args.command })}));`;
+  if (["Read", "Write", "Edit"].includes(name)) {
+    const file = valueText(args.file_path);
+    const command =
+      name === "Read"
+        ? `cat ${JSON.stringify(file)}`
+        : name === "Write"
+          ? `cat > ${JSON.stringify(file)} <<'EVAL_EOF'\n${valueText(args.content)}\nEVAL_EOF`
+          : `python3 -c ${JSON.stringify(`from pathlib import Path; p=Path(${JSON.stringify(file)}); p.write_text(p.read_text().replace(${JSON.stringify(args.old_string)}, ${JSON.stringify(args.new_string)}))`)}`;
+    return `text(await tools.exec_command(${JSON.stringify({ cmd: command })}));`;
+  }
+  return `text(await tools.${name.replace("mcp__t3-code__", "mcp__t3_code__")}(${JSON.stringify(input)}));`;
+};
+const codexMessages = (messages: ReadonlyArray<ApiMessage>): Array<Block> =>
+  messages.flatMap((message) =>
+    message.content.map((block): Block =>
+      block.type === "tool_use"
+        ? {
+            type: "custom_tool_call",
+            call_id: block.id,
+            name: "exec",
+            input: codexCall(valueText(block.name), block.input),
+          }
+        : block.type === "tool_result"
+          ? {
+              type: "custom_tool_call_output",
+              call_id: block.tool_use_id,
+              output: valueText(block.content),
+            }
+          : {
+              type: "message",
+              role: message.role,
+              content: [
+                {
+                  type: message.role === "user" ? "input_text" : "output_text",
+                  text: valueText(block.text),
+                },
+              ],
+            },
+    ),
+  );
 /** One tool call the shell simulator has answered, or one from the case's prior turns. */
 type ShellEntry = { readonly tool: string; readonly input: unknown; readonly output: string };
 /**
@@ -386,6 +538,7 @@ type Sample = {
   readonly shell: Array<ShellEntry>;
   readonly shellUsage: Usage;
   readonly linked: Set<string>;
+  readonly codeStore: Record<string, unknown>;
   nextTask: number;
 };
 
@@ -413,6 +566,7 @@ export const makeSample = (testCase: McpToolUseCase, base: Base): Sample => {
     shell,
     shellUsage: emptyUsage(),
     linked: new Set(urls),
+    codeStore: {},
     nextTask: Math.max(0, ...taskNumbers) + 1,
   };
 };
@@ -454,7 +608,8 @@ const gitStatus = ({ setup }: McpToolUseCase) => {
 };
 
 const findTool = (base: Base, bare: string) =>
-  [...base.nativeTools, ...base.deferred].find((tool) => normalizeToolName(tool.name) === bare);
+  [...base.nativeTools, ...base.deferred].find((tool) => normalizeToolName(tool.name) === bare) ??
+  (base.codex ? { name: bare } : undefined);
 
 /** Adds deferred schemas to `tools` and returns the ToolSearch result Claude Code sends. */
 const loadTools = (tools: Array<ApiTool>, id: string, found: ReadonlyArray<ApiTool>): Block => {
@@ -494,7 +649,7 @@ export const buildMessages = ({ testCase, base, tools }: Sample) => {
     const unloaded = [...new Set(calls.map((call) => call.tool))].filter(
       (tool) => !hasTool(tools, tool.name),
     );
-    if (unloaded.length > 0) {
+    if (unloaded.length > 0 && !base.codex) {
       const id = `toolu_prior_${nextId++}`;
       const query = `select:${unloaded.map((tool) => tool.name).join(",")}`;
       const input = { query, max_results: unloaded.length };
@@ -565,7 +720,10 @@ const t3Default = (sample: Sample, name: string, input: Readonly<Record<string, 
   const pr = () => pullRequest(sample.repo, input);
   switch (name) {
     case "orchestrator_capabilities":
-      return DEFAULT_CAPABILITIES;
+      return {
+        ...DEFAULT_CAPABILITIES,
+        ...(sample.base.codex ? { inheritedProviderInstanceId: "codex", inheritedModel: SOL } : {}),
+      };
     case "delegate_task": {
       const n = sample.nextTask++;
       const target = isRecord(input.target) ? input.target : {};
@@ -577,8 +735,9 @@ const t3Default = (sample: Sample, name: string, input: Readonly<Record<string, 
         workState: "working",
         hasPendingChildRuns: false,
         providerInstanceId:
-          target.providerInstanceId ?? DEFAULT_CAPABILITIES.inheritedProviderInstanceId,
-        model: target.model ?? DEFAULT_CAPABILITIES.inheritedModel,
+          target.providerInstanceId ??
+          (sample.base.codex ? "codex" : DEFAULT_CAPABILITIES.inheritedProviderInstanceId),
+        model: target.model ?? (sample.base.codex ? SOL : DEFAULT_CAPABILITIES.inheritedModel),
         summary: null,
         hasPendingQuestion: false,
         pendingApproval: null,
@@ -643,6 +802,16 @@ const t3Default = (sample: Sample, name: string, input: Readonly<Record<string, 
   }
 };
 
+const capabilities = (sample: Sample, value: unknown) =>
+  sample.base.codex && isRecord(value)
+    ? {
+        ...value,
+        inheritedProviderInstanceId: "codex",
+        inheritedModel: SOL,
+        inheritedOptions: [{ id: "reasoningEffort", value: sample.base.codex.reasoning.effort }],
+      }
+    : value;
+
 /** ToolSearch: `select:a,b` loads those tools. Other queries load tools whose name has a word. */
 const searchTools = (base: Base, query: string, max: number) => {
   if (query.startsWith("select:")) {
@@ -677,7 +846,7 @@ const nativeResult = (name: string, input: Readonly<Record<string, unknown>>) =>
 const SHELL_PROMPT = `You play the computer a coding agent works on. You get a description of the machine, the agent's tool calls so far with their outputs, and one new call. Reply in JSON. In "facts", note briefly what the output must agree with. In "output", put only the call's output, exactly as the tool prints it: no notes, headings, code fences, or corrections. The agent sees "output" unchanged.
 
 - Bash: what the command prints in a real terminal (git, gh, ls, cat, grep, package managers). If it fails, start with "Exit code N", then the error. If it prints nothing, reply "(Bash completed with no output)".
-- Read: the file with numbered lines, like \`cat -n\`. Write: "File created successfully at: <path>". Edit: "The file <path> has been updated successfully." A missing file, or an Edit whose old_string is not in the file: "<tool_use_error>reason</tool_use_error>".
+- Read: the file with numbered lines, like \`cat -n\`. Write: "File created successfully at: <path>". Edit: "The file <path> has been updated successfully." Edit may instead supply a Codex apply_patch patch; apply its additions, deletions and hunks. A missing file, or an Edit whose old_string is not in the file: "<tool_use_error>reason</tool_use_error>".
 - WebFetch: the page's text.
 
 Stay consistent with the machine and with earlier outputs: edits, commits, pushes, and new PRs show in later output. Where the description is silent, invent plausible small details that fit it (file contents, SHAs, test names) rather than printing nothing. Commands succeed unless the description says otherwise, including git push, gh pr create, installs, builds, and tests. A new PR gets the next number after the highest one in the description or the history, or 124 if there is none.`;
@@ -743,6 +912,8 @@ export const mockOutput = (sample: Sample, command: string) =>
 
 type Config = {
   readonly apiKey: string;
+  readonly model: Model;
+  readonly proxy?: { readonly url: string; readonly headers: Readonly<Record<string, string>> };
   readonly effort: string;
   readonly maxSteps: number;
   readonly shellModel: PricedModel;
@@ -758,7 +929,11 @@ const simulate = Effect.fn("evaluateMcpToolUse.simulate")(function* (
   let output = typeof command === "string" ? mockOutput(sample, command) : undefined;
   if (output === undefined) {
     const body = shellRequest(sample, call, config.shellModel);
-    const response = yield* callModel(config.apiKey, body);
+    const response = yield* callModel(
+      config.apiKey,
+      body,
+      config.apiKey ? undefined : config.proxy,
+    );
     addUsage(sample.shellUsage, response.usage);
     output = shellOutput(response.content);
   }
@@ -774,10 +949,20 @@ const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(function* 
   call: typeof ToolUse.Type,
 ) {
   const { testCase, base, tools } = sample;
-  const name = normalizeToolName(call.name);
-  const input = isRecord(call.input) ? call.input : {};
+  let name = normalizeToolName(call.name);
+  let input = isRecord(call.input) ? call.input : {};
+  if (call.name === "web__run") {
+    const open = Array.isArray(input.open) ? input.open[0] : undefined;
+    const search = Array.isArray(input.search_query) ? input.search_query[0] : undefined;
+    name = open ? "WebFetch" : "WebSearch";
+    input = isRecord(open)
+      ? { url: open.ref_id, prompt: "Return the page content." }
+      : isRecord(search)
+        ? { query: search.q }
+        : input;
+  }
   const failed = (error: string): Block => ({ ...toolResult(call.id, error), is_error: true });
-  if (!hasTool(tools, call.name)) {
+  if (!base.codex && !hasTool(tools, call.name)) {
     const error = `InputValidationError: ${call.name} is deferred. Load it with ToolSearch first.`;
     return failed(`<tool_use_error>${error}</tool_use_error>`);
   }
@@ -788,16 +973,28 @@ const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(function* 
     return loadTools(tools, call.id, found);
   }
   const mock = testCase.setup.mocks?.[name];
-  if (mock !== undefined && mock !== "default") return toolResult(call.id, mock);
+  if (mock !== undefined && mock !== "default")
+    return toolResult(
+      call.id,
+      name === "orchestrator_capabilities" ? capabilities(sample, mock) : mock,
+    );
   if (isT3Name(call.name)) {
     // T3 refuses a watch from a delegated child.
     if (name === "watch_pull_request" && testCase.setup.role === "delegated-child") {
       return failed(SUBAGENT_WATCH_ERROR);
     }
-    return toolResult(call.id, t3Default(sample, name, input));
+    const value = t3Default(sample, name, input);
+    return toolResult(
+      call.id,
+      name === "orchestrator_capabilities" ? capabilities(sample, value) : value,
+    );
   }
+  if (call.name === "clock__curr_time")
+    return toolResult(call.id, {
+      current_time: `${base.environment.date ?? "2026-01-01"} 12:00:00 UTC`,
+    });
   if (!SHELL_TOOLS.has(name)) return toolResult(call.id, nativeResult(name, input));
-  const output = yield* simulate(sample, config, { tool: name, input: call.input });
+  const output = yield* simulate(sample, config, { tool: name, input });
   // Claude Code marks a failed command or file call as an error.
   return /^(Exit code [1-9]|<tool_use_error>)/.test(output)
     ? failed(output)
@@ -899,9 +1096,160 @@ const requestBody = ({ base, tools }: Sample, effort: string, messages: unknown)
   messages,
 });
 
-const callModel = Effect.fn("evaluateMcpToolUse.callModel")(function* (
+const codexRequest = (base: Base, input: ReadonlyArray<Block>) => ({
+  model: SOL,
+  stream: true,
+  store: false,
+  parallel_tool_calls: true,
+  reasoning: base.codex?.reasoning,
+  instructions: base.codex?.instructions,
+  text: base.codex?.text,
+  tool_choice: base.codex?.tool_choice,
+  include: ["reasoning.encrypted_content"],
+  input: [...(base.codex?.input ?? []), ...input],
+});
+
+/** The bridge only accepts serialized data. Model code never receives host objects/functions. */
+export const executeCodex = async (
+  code: string,
+  catalog: ReadonlyArray<{ name: string; description: string }>,
+  answer: (name: string, input: unknown) => Promise<unknown>,
+  saved: Record<string, unknown> = {},
+) => {
+  const pending: Array<{ name: string; input: string; resolve: (value: string) => void }> = [];
+  const bridge = Object.setPrototypeOf(
+    (name: string, input: string, resolve: (value: string) => void) =>
+      pending.push({ name, input, resolve }),
+    null,
+  );
+  const context = NodeVM.createContext(
+    { __bridge: bridge, __catalog: JSON.stringify(catalog), __storeJson: JSON.stringify(saved) },
+    { codeGeneration: { strings: false, wasm: false }, microtaskMode: "afterEvaluate" },
+  );
+  const run = (source: string) => NodeVM.runInContext(source, context, { timeout: 250 });
+  run(`((bridge, catalog) => {
+    delete globalThis.__bridge; delete globalThis.__catalog;
+    globalThis.ALL_TOOLS = catalog;
+    globalThis.tools = Object.fromEntries(catalog.map(({name}) => [name, (input) => new Promise(resolve => bridge(name, JSON.stringify(input ?? {}), value => resolve(JSON.parse(value))))]));
+    globalThis.__output = []; globalThis.__done = false;
+    globalThis.text = globalThis.notify = value => __output.push(typeof value === 'string' ? value : JSON.stringify(value));
+    globalThis.__stored = JSON.parse(__storeJson); delete globalThis.__storeJson;
+    globalThis.store = (k,v) => __stored[k] = v; globalThis.load = k => __stored[k];
+  })(__bridge, JSON.parse(__catalog));
+  (async () => { ${code}\n })().then(() => { __done = true; }, e => { text(String(e)); __done = true; });`);
+  for (let count = 0; !context.__done && count < 128; count++) {
+    const job = pending.shift();
+    if (!job) throw new Error("Code cell stalled without a tool call.");
+    const result = await answer(job.name, JSON.parse(job.input));
+    context.__resolve = job.resolve;
+    context.__result = JSON.stringify(result ?? null);
+    run("__resolve(__result); delete globalThis.__resolve; delete globalThis.__result;");
+  }
+  if (!context.__done) throw new Error("Code cell exceeded 128 tool calls.");
+  Object.assign(saved, JSON.parse(run("JSON.stringify(__stored)")));
+  return valueText(context.__output.join("\n"));
+};
+
+const codexCatalog = (base: Base) => [
+  ...t3Tools.map((tool) => ({
+    name: tool.name.replace("mcp__t3-code__", "mcp__t3_code__"),
+    description: `${valueText(tool.description)}\nInput JSON schema: ${JSON.stringify(tool.input_schema)}`,
+  })),
+  ...[
+    ...valueText(base.nativeTools.find((tool) => tool.name === "exec")?.description).matchAll(
+      /### `([^`]+)`/g,
+    ),
+  ].map((match) => ({ name: match[1]!, description: match[1]! })),
+];
+
+const CodexResponse = Schema.Struct({
+  output: Schema.Array(AnyBlock),
+  usage: Schema.Struct({
+    input_tokens: Schema.Number,
+    output_tokens: Schema.Number,
+    input_tokens_details: Schema.Struct({ cached_tokens: Schema.Number }),
+  }),
+});
+
+const decodeCodexResponse = Schema.decodeUnknownEffect(CodexResponse);
+const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+
+const callCodex = Effect.fn("evaluateMcpToolUse.callCodex")(function* (
+  config: Config,
+  body: unknown,
+) {
+  const raw = yield* postModel("", body, config.proxy, true);
+  const completed = raw
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    .find((event) => event.type === "response.completed");
+  if (!completed)
+    return yield* Effect.die(new Error("Responses stream ended without response.completed."));
+  const response = yield* decodeCodexResponse(completed.response);
+  return {
+    raw: response.output,
+    content: response.output.flatMap((item): Array<Block> => {
+      if (item.type === "message" && Array.isArray(item.content))
+        return item.content.map((part: Block) => text(valueText(part.text)));
+      if (item.type === "function_call" || item.type === "custom_tool_call")
+        return [
+          {
+            type: "tool_use",
+            id: item.call_id,
+            name: item.name,
+            input:
+              item.type === "custom_tool_call" ? item.input : JSON.parse(valueText(item.arguments)),
+          },
+        ];
+      return [];
+    }),
+    stop_reason: response.output.some(
+      (item) => item.type.endsWith("tool_call") || item.type === "function_call",
+    )
+      ? "tool_use"
+      : "end_turn",
+    usage: {
+      ...response.usage,
+      input_tokens: response.usage.input_tokens - response.usage.input_tokens_details.cached_tokens,
+      cache_read_input_tokens: response.usage.input_tokens_details.cached_tokens,
+    },
+  };
+});
+
+// Read credentials into memory only. Python's TOML parser avoids another runner dependency.
+const decodeProxyConfig = Schema.decodeUnknownSync(
+  Schema.Struct({ url: Schema.String, headers: Schema.Record(Schema.String, Schema.String) }),
+);
+const proxyConfig = () =>
+  decodeProxyConfig(
+    JSON.parse(
+      NodeChildProcess.execFileSync(
+        "python3",
+        [
+          "-c",
+          `
+import json, os, pathlib, tomllib
+home = pathlib.Path.home() / '.codex'
+p = tomllib.loads((home / 'config.toml').read_text())['model_providers']['vibeproxy']
+h = p.get('http_headers', {}).copy()
+h.update({k: os.environ[v] for k,v in p.get('env_http_headers', {}).items()})
+key = os.environ[p['env_key']] if p.get('env_key') else p.get('experimental_bearer_token')
+if not key and p.get('requires_openai_auth'): key = json.loads((home / 'auth.json').read_text()).get('OPENAI_API_KEY')
+if key: h['Authorization'] = 'Bearer ' + key
+print(json.dumps({'url': p['base_url'].rstrip('/'), 'headers': h}))
+`,
+        ],
+        { encoding: "utf8" },
+      ),
+    ),
+  );
+
+const postModel = Effect.fn("evaluateMcpToolUse.postModel")(function* (
   apiKey: string,
   body: unknown,
+  proxy?: Config["proxy"],
+  responses = false,
 ) {
   const client = (yield* HttpClient.HttpClient).pipe(
     HttpClient.retryTransient({
@@ -910,22 +1258,29 @@ const callModel = Effect.fn("evaluateMcpToolUse.callModel")(function* (
       times: 4,
     }),
   );
-  const response = yield* HttpClientRequest.post("https://api.anthropic.com/v1/messages").pipe(
+  const response = yield* HttpClientRequest.post(
+    `${proxy?.url ?? "https://api.anthropic.com/v1"}/${responses ? "responses" : "messages"}`,
+  ).pipe(
     HttpClientRequest.setHeaders({
-      "x-api-key": apiKey,
+      ...(apiKey ? { "x-api-key": apiKey } : {}),
       "anthropic-version": "2023-06-01",
       // Claude Code sends this beta for `defer_loading` tools and `tool_reference` results.
       "anthropic-beta": "advanced-tool-use-2025-11-20",
+      ...proxy?.headers,
     }),
     HttpClientRequest.bodyJson(body),
     Effect.flatMap(client.execute),
   );
   if (response.status !== 200) {
     const body = yield* response.text;
-    return yield* Effect.die(new Error(`Anthropic API ${response.status}: ${body}`));
+    return yield* Effect.die(new Error(`Model API ${response.status}: ${body}`));
   }
-  return yield* HttpClientResponse.schemaBodyJson(ApiResponse)(response);
+  return yield* response.text;
 });
+const callModel = (apiKey: string, body: unknown, proxy?: Config["proxy"]) =>
+  postModel(apiKey, body, proxy).pipe(
+    Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(ApiResponse))),
+  );
 
 /**
  * Runs one sample until the model ends its turn, uses up its steps, or fails a check that no
@@ -937,20 +1292,33 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
   base: Base,
 ) {
   const sample = makeSample(testCase, base);
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<HttpClient.HttpClient>());
   const messages = buildMessages(sample);
+  const input = base.codex ? codexMessages(messages) : undefined;
+  const transcript: Array<unknown> = [];
   const start = messages.length;
   const calls: Array<Call> = [];
   const said: Array<string> = [];
   const usage = emptyUsage();
   let stopReason = "max_steps";
   for (let step = 0; step < (testCase.maxSteps ?? config.maxSteps); step++) {
-    const response = yield* callModel(config.apiKey, requestBody(sample, config.effort, messages));
+    const response = input
+      ? yield* callCodex(config, codexRequest(base, input))
+      : yield* callModel(config.apiKey, requestBody(sample, config.effort, messages));
     addUsage(usage, response.usage);
+    if ("raw" in response) {
+      input?.push(...response.raw);
+      transcript.push(...response.raw);
+    }
     messages.push({ role: "assistant", content: response.content });
     said.push(...response.content.filter(isText).map((block) => block.text));
     const uses = response.content.filter(isToolUse);
     calls.push(
-      ...uses.map((use) => ({ step, tool: normalizeToolName(use.name), input: use.input })),
+      ...uses.map((use) => ({
+        step,
+        tool: normalizeToolName(use.name),
+        input: normalizeToolInput(use.name, use.input),
+      })),
     );
     if (response.stop_reason !== "tool_use") {
       stopReason = response.stop_reason ?? "unknown";
@@ -960,10 +1328,63 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
       stopReason = "failed_early";
       break;
     }
-    const results = yield* Effect.forEach(uses, (use) => answerToolCall(sample, config, use));
+    const results = yield* Effect.forEach(uses, (use) =>
+      Effect.gen(function* () {
+        if (!input) return yield* answerToolCall(sample, config, use);
+        const answer = (name: string, args: unknown, record = true) => {
+          const tool = normalizeToolName(name);
+          const normalized = normalizeToolInput(name, args);
+          if (record) calls.push({ step, tool, input: normalized });
+          const call = { ...use, name, input: normalized };
+          return answerToolCall(sample, config, call).pipe(
+            Effect.map((result) => {
+              const output = valueText(result.content);
+              if (isT3Name(name))
+                return {
+                  content: [text(output)],
+                  ...(!result.is_error
+                    ? { structuredContent: Option.getOrElse(decodeJson(output), () => output) }
+                    : { isError: true }),
+                };
+              return tool === "Bash"
+                ? {
+                    output,
+                    exit_code: /^Exit code [1-9]/.test(output) ? 1 : 0,
+                    wall_time_seconds: 0,
+                  }
+                : output;
+            }),
+            runPromise,
+          );
+        };
+        return yield* Effect.tryPromise(async () => {
+          const output =
+            use.name === "exec"
+              ? await executeCodex(
+                  valueText(use.input),
+                  codexCatalog(base),
+                  answer,
+                  sample.codeStore,
+                )
+              : await answer(use.name, use.input, false);
+          const item = {
+            type: use.name === "exec" ? "custom_tool_call_output" : "function_call_output",
+            call_id: use.id,
+            output: valueText(output),
+          };
+          input.push(item);
+          transcript.push(item);
+          return toolResult(use.id, output);
+        });
+      }),
+    );
     // Claude Code adds this text after a ToolSearch that loaded tools.
     const loaded = results.some((result) => Array.isArray(result.content));
     messages.push({ role: "user", content: [...results, ...(loaded ? [text(TOOL_LOADED)] : [])] });
+    if (failedEarly(testCase.expect, { calls, text: said.join("\n\n"), stopReason })) {
+      stopReason = "failed_early";
+      break;
+    }
   }
   // The transcript (model turns and tool results) shows what the agent saw when a case fails.
   return {
@@ -972,7 +1393,7 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
     stopReason,
     usage,
     shellUsage: sample.shellUsage,
-    transcript: messages.slice(start),
+    transcript: input ? transcript : messages.slice(start),
   };
 });
 
@@ -1000,7 +1421,7 @@ const spend = (usages: ReadonlyArray<Usage>, model: PricedModel) => {
 /** Markdown report. With a baseline, each case shows its earlier pass rate and the change. */
 const summarize = (
   rows: Array<ResultRow>,
-  options: { readonly header: string; readonly shellModel: PricedModel },
+  options: { readonly header: string; readonly shellModel: PricedModel; readonly model: Model },
   before?: Map<string, number>,
 ) => {
   const agent = spend(
@@ -1026,16 +1447,22 @@ const summarize = (
     "",
   ];
   const nativeNote =
-    "- native-subagent cases are approximate: Claude Code gives Agent subagents their own system prompt, which this runner does not rebuild.";
+    "- native-subagent cases are approximate: the harness gives subagents their own system prompt, which this runner does not rebuild.";
   const identityNote = `- The captured Claude Code identity line is replaced with "${NEUTRAL_IDENTITY}"`;
   return [
     "# MCP tool-use eval\n",
     `- ${options.header}`,
     `- Pass: ${percent(passRate(rows))} of ${rows.length} samples. Samples that failed to run count as failures.`,
-    `- Estimated cost $${cost.toFixed(2)}, $${(cost / rows.length).toFixed(3)} per sample.`,
-    `- Agent tokens: ${agent.tokens} ($${agent.cost.toFixed(2)}).`,
-    `- Shell simulator (${options.shellModel}) tokens: ${shell.tokens} ($${shell.cost.toFixed(2)}).`,
-    identityNote,
+    options.model === SOL
+      ? "- Cost: not applicable (subscription through proxy)."
+      : `- Estimated cost $${cost.toFixed(2)}, $${(cost / rows.length).toFixed(3)} per sample.`,
+    `- Agent tokens: ${agent.tokens}${options.model === SOL ? "." : ` ($${agent.cost.toFixed(2)}).`}`,
+    `- Shell simulator (${options.shellModel}) tokens: ${shell.tokens} (API-price estimate $${shell.cost.toFixed(2)}).`,
+    ...(options.model === SOL
+      ? [
+          "- Code-mode tools use case mocks and a simulated machine. Native subagent prompts and asynchronous notifications are approximate.",
+        ]
+      : [identityNote]),
     ...(rows.some((row) => row.role === "native-subagent") ? [nativeNote] : []),
     "",
     ...table("Cases", (row) => row.id, before !== undefined),
@@ -1046,6 +1473,7 @@ const summarize = (
 
 const PositiveInt = Schema.FiniteFromString.check(Schema.isInt(), Schema.isGreaterThan(0));
 const Flags = Schema.Struct({
+  model: Schema.Literals([MODEL, SOL]),
   template: Schema.String,
   cases: Schema.optional(Schema.Array(Schema.String)),
   out: Schema.optional(Schema.String),
@@ -1054,7 +1482,7 @@ const Flags = Schema.Struct({
   samples: Schema.optional(PositiveInt),
   concurrency: PositiveInt,
   "max-steps": PositiveInt,
-  effort: Schema.Literals(EFFORTS),
+  effort: Schema.optional(Schema.Literals(EFFORTS)),
   "shell-model": Schema.Literals(Object.keys(PRICES) as Array<PricedModel>),
   "user-instructions": Schema.Literals(["keep", "drop"]),
   "dry-run": Schema.Boolean,
@@ -1063,6 +1491,7 @@ const Flags = Schema.Struct({
 });
 const decodeFlags = Schema.decodeUnknownEffect(Flags);
 const decodeCapture = Schema.decodeUnknownEffect(Schema.fromJsonString(Capture));
+const decodeCodexCapture = Schema.decodeUnknownEffect(Schema.fromJsonString(CodexCapture));
 const decodeCase = Schema.decodeUnknownEffect(Schema.fromJsonString(McpToolUseCase));
 const decodeBaselineRow = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ id: Schema.String, pass: Schema.Boolean })),
@@ -1073,6 +1502,7 @@ const string = { type: "string" } as const;
 const main = Effect.gen(function* () {
   const { values } = NodeUtil.parseArgs({
     options: {
+      model: { ...string, default: MODEL },
       template: string,
       cases: { ...string, multiple: true },
       out: string,
@@ -1082,7 +1512,7 @@ const main = Effect.gen(function* () {
       samples: string,
       concurrency: { ...string, default: "4" },
       "max-steps": { ...string, default: "6" },
-      effort: { ...string, default: "high" },
+      effort: string,
       "shell-model": { ...string, default: "claude-haiku-5-5" },
       // T3's text must work for every user, so the captured CLAUDE.md is dropped by default.
       "user-instructions": { ...string, default: "drop" },
@@ -1094,7 +1524,7 @@ const main = Effect.gen(function* () {
   });
   const flags = yield* decodeFlags({ template: "", ...values });
   if (flags.context) {
-    process.stdout.write(`${t3ContextReport()}\n`);
+    process.stdout.write(`${t3ContextReport(flags.model)}\n`);
     return;
   }
   if (flags["stop-on-regression"] && flags.baseline === undefined) {
@@ -1118,29 +1548,49 @@ const main = Effect.gen(function* () {
   const wanted = flags.case?.flatMap((ids) => ids.split(","));
   const selected = cases.filter(({ id }) => wanted === undefined || wanted.includes(id));
   if (selected.length === 0) return yield* Effect.die(new Error("No case matches --case."));
-  if (flags.template === "") return yield* Effect.die(new Error("Pass --template <capture>."));
-  const capture = yield* fs.readFileString(flags.template).pipe(Effect.flatMap(decodeCapture));
+  const templatePath =
+    flags.template ||
+    path.join(
+      NodeOS.homedir(),
+      ".t3/scratch/mcp-eval/templates",
+      flags.model === SOL ? "codex-raw.json" : "claude-raw.json",
+    );
+  const template = yield* fs.readFileString(templatePath);
   const keepUserInstructions = flags["user-instructions"] === "keep";
-  const base = buildBase(capture.request.provider_native, { keepUserInstructions });
+  const base: Base =
+    flags.model === SOL
+      ? buildCodexBase((yield* decodeCodexCapture(template)).request.provider_native, {
+          keepUserInstructions,
+          effort: flags.effort,
+        })
+      : buildBase((yield* decodeCapture(template)).request.provider_native, {
+          keepUserInstructions,
+        });
+  const effort = flags.effort ?? base.codex?.reasoning.effort ?? "high";
   if (flags["dry-run"]) {
     // One JSON line per case. Without --case this also checks that every case builds.
     for (const testCase of selected) {
       const sample = makeSample(testCase, base);
-      const body = requestBody(sample, flags.effort, buildMessages(sample));
+      const messages = buildMessages(sample);
+      const body = base.codex
+        ? codexRequest(base, codexMessages(messages))
+        : requestBody(sample, effort, messages);
       process.stdout.write(`${yield* encodeJson(body)}\n`);
     }
     return;
   }
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.ANTHROPIC_API_KEY ?? "";
   const out = flags.out;
-  if (!apiKey || out === undefined) {
+  if ((!apiKey && flags.model !== SOL) || out === undefined) {
     const message =
       "Set ANTHROPIC_API_KEY and pass --out <directory>. ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL are never used.";
     return yield* Effect.die(new Error(message));
   }
   const config: Config = {
     apiKey,
-    effort: flags.effort,
+    model: flags.model,
+    ...(flags.model === SOL ? { proxy: proxyConfig() } : {}),
+    effort,
     maxSteps: flags["max-steps"],
     shellModel: flags["shell-model"],
   };
@@ -1153,9 +1603,20 @@ const main = Effect.gen(function* () {
     const { id, kind, pattern } = testCase;
     const identity = { id, kind, pattern, role: testCase.setup.role };
     const usage = { usage: emptyUsage(), shellUsage: emptyUsage() };
+    const privateValues = [config.apiKey, ...Object.values(config.proxy?.headers ?? {})]
+      .flatMap((value) => [value, value.replace(/^Bearer /i, "")])
+      .filter(Boolean);
     return runSample(testCase, config, base).pipe(
       Effect.matchCause({
-        onFailure: (cause) => ({ ...identity, ...usage, pass: false, error: Cause.pretty(cause) }),
+        onFailure: (cause) => ({
+          ...identity,
+          ...usage,
+          pass: false,
+          error: privateValues.reduce(
+            (message, value) => message.replaceAll(value, "[redacted]"),
+            Cause.pretty(cause),
+          ),
+        }),
         onSuccess: (sample) => {
           const checks = gradeSample(testCase.expect, sample);
           return { ...identity, pass: checks.every((check) => check.pass), checks, ...sample };
@@ -1198,7 +1659,7 @@ const main = Effect.gen(function* () {
     encoding: "utf8",
   }).trim();
   const samples = flags.samples === undefined ? "2-3 (adaptive)" : flags.samples;
-  const header = `Commit \`${commit}\`, ${MODEL} at ${flags.effort} effort, user instructions ${flags["user-instructions"]}, ${samples} samples per case, template \`${path.basename(flags.template)}\``;
+  const header = `Commit \`${commit}\`, ${flags.model} at ${effort} effort, user instructions ${flags["user-instructions"]}, ${samples} samples per case, template \`${path.basename(templatePath)}\``;
   const stopped =
     regression === undefined
       ? []
@@ -1207,7 +1668,11 @@ const main = Effect.gen(function* () {
         ];
   const summary = summarize(
     rows,
-    { header: [header, t3ContextReport(), ...stopped].join("\n"), shellModel: config.shellModel },
+    {
+      header: [header, t3ContextReport(flags.model), ...stopped].join("\n"),
+      shellModel: config.shellModel,
+      model: config.model,
+    },
     flags.baseline === undefined ? undefined : baseline,
   );
   yield* fs.makeDirectory(out, { recursive: true });
