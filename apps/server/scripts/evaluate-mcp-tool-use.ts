@@ -268,6 +268,22 @@ export const t3SystemAppend = () => {
   throw new Error("makeClaudeQueryOptions no longer appends T3 text to a preset prompt.");
 };
 
+/**
+ * Size of the context T3 adds: the system text every Claude thread gets, and the tool
+ * descriptions and schemas (loaded on demand here, sent up front by harnesses without
+ * deferred tools). Tokens are estimated at 4 characters each.
+ */
+const t3ContextReport = () => {
+  const size = (chars: number) => `${chars} chars (~${Math.round(chars / 4)} tokens)`;
+  const descriptions = t3Tools.reduce((sum, tool) => sum + valueText(tool.description).length, 0);
+  const schemas = JSON.stringify(t3Tools).length;
+  return [
+    `- T3 context: system text ${size(t3SystemAppend().length)}`,
+    `tool descriptions ${size(descriptions)}`,
+    `full tool schemas ${size(schemas)} across ${t3Tools.length} tools.`,
+  ].join(", ");
+};
+
 const stringProperty = (description: string) => ({ type: "string", description });
 const NATIVE_SCHEMAS: Readonly<Record<string, Omit<ApiTool, "name">>> = {
   WebFetch: {
@@ -1042,6 +1058,8 @@ const Flags = Schema.Struct({
   "shell-model": Schema.Literals(Object.keys(PRICES) as Array<PricedModel>),
   "user-instructions": Schema.Literals(["keep", "drop"]),
   "dry-run": Schema.Boolean,
+  "stop-on-regression": Schema.Boolean,
+  context: Schema.Boolean,
 });
 const decodeFlags = Schema.decodeUnknownEffect(Flags);
 const decodeCapture = Schema.decodeUnknownEffect(Schema.fromJsonString(Capture));
@@ -1069,9 +1087,19 @@ const main = Effect.gen(function* () {
       // T3's text must work for every user, so the captured CLAUDE.md is dropped by default.
       "user-instructions": { ...string, default: "drop" },
       "dry-run": { type: "boolean", default: false },
+      "stop-on-regression": { type: "boolean", default: false },
+      // Prints the size of T3's text and tool schemas, then exits. Needs no template or key.
+      context: { type: "boolean", default: false },
     },
   });
-  const flags = yield* decodeFlags(values);
+  const flags = yield* decodeFlags({ template: "", ...values });
+  if (flags.context) {
+    process.stdout.write(`${t3ContextReport()}\n`);
+    return;
+  }
+  if (flags["stop-on-regression"] && flags.baseline === undefined) {
+    return yield* Effect.die(new Error("--stop-on-regression needs --baseline."));
+  }
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const readJsonl = <A, E>(file: string, decode: (line: string) => Effect.Effect<A, E>) =>
@@ -1090,6 +1118,7 @@ const main = Effect.gen(function* () {
   const wanted = flags.case?.flatMap((ids) => ids.split(","));
   const selected = cases.filter(({ id }) => wanted === undefined || wanted.includes(id));
   if (selected.length === 0) return yield* Effect.die(new Error("No case matches --case."));
+  if (flags.template === "") return yield* Effect.die(new Error("Pass --template <capture>."));
   const capture = yield* fs.readFileString(flags.template).pipe(Effect.flatMap(decodeCapture));
   const keepUserInstructions = flags["user-instructions"] === "keep";
   const base = buildBase(capture.request.provider_native, { keepUserInstructions });
@@ -1115,50 +1144,70 @@ const main = Effect.gen(function* () {
     maxSteps: flags["max-steps"],
     shellModel: flags["shell-model"],
   };
-  const run = (jobs: ReadonlyArray<McpToolUseCase>) =>
-    Effect.forEach(
-      jobs,
-      (testCase) => {
-        const { id, kind, pattern } = testCase;
-        const identity = { id, kind, pattern, role: testCase.setup.role };
-        const usage = { usage: emptyUsage(), shellUsage: emptyUsage() };
-        return runSample(testCase, config, base).pipe(
-          Effect.matchCause({
-            onFailure: (cause) => ({
-              ...identity,
-              ...usage,
-              pass: false,
-              error: Cause.pretty(cause),
-            }),
-            onSuccess: (sample) => {
-              const checks = gradeSample(testCase.expect, sample);
-              return { ...identity, pass: checks.every((check) => check.pass), checks, ...sample };
-            },
-          }),
-          Effect.tap((row) => Effect.log(`${row.id}: ${row.pass ? "pass" : "FAIL"}`)),
-        );
-      },
-      { concurrency: flags.concurrency },
-    );
-  const repeat = (n: number) =>
-    selected.flatMap((testCase) => Array.from({ length: n }, () => testCase));
-  const first = yield* run(repeat(flags.samples ?? 2));
-  // Without --samples, a case whose 2 samples disagree gets a 3rd to settle it.
-  const split = selected.filter(
-    ({ id }) => new Set(first.filter((row) => row.id === id).map((row) => row.pass)).size > 1,
-  );
-  const rows = [...first, ...(flags.samples === undefined ? yield* run(split) : [])];
   const previous =
     flags.baseline === undefined ? [] : yield* readJsonl(flags.baseline, decodeBaselineRow);
   const baseline = new Map(groups(previous, (row) => row.id).map(([id, r]) => [id, passRate(r)]));
+  // A case passes when most of its samples pass.
+  const passedBefore = (id: string) => (baseline.get(id) ?? 0) > 0.5;
+  const runOne = (testCase: McpToolUseCase) => {
+    const { id, kind, pattern } = testCase;
+    const identity = { id, kind, pattern, role: testCase.setup.role };
+    const usage = { usage: emptyUsage(), shellUsage: emptyUsage() };
+    return runSample(testCase, config, base).pipe(
+      Effect.matchCause({
+        onFailure: (cause) => ({ ...identity, ...usage, pass: false, error: Cause.pretty(cause) }),
+        onSuccess: (sample) => {
+          const checks = gradeSample(testCase.expect, sample);
+          return { ...identity, pass: checks.every((check) => check.pass), checks, ...sample };
+        },
+      }),
+      Effect.tap((row) => Effect.log(`${row.id}: ${row.pass ? "pass" : "FAIL"}`)),
+    );
+  };
+  // Without --samples, a case whose 2 samples disagree gets a 3rd to settle it.
+  const runCase = Effect.fn("evaluateMcpToolUse.runCase")(function* (testCase: McpToolUseCase) {
+    const samples = Array.from({ length: flags.samples ?? 2 }, () => testCase);
+    const first = yield* Effect.forEach(samples, runOne, { concurrency: "unbounded" });
+    const split = flags.samples === undefined && new Set(first.map((row) => row.pass)).size > 1;
+    return split ? [...first, yield* runOne(testCase)] : first;
+  });
+  // --stop-on-regression runs cases that passed in the baseline first and stops at the first
+  // one that now fails, so a copy change that breaks a passing case fails fast.
+  const stopEarly = flags["stop-on-regression"];
+  const ordered = stopEarly
+    ? selected.toSorted((a, b) => Number(passedBefore(b.id)) - Number(passedBefore(a.id)))
+    : selected;
+  const rows: Array<Effect.Success<ReturnType<typeof runOne>>> = [];
+  let regression: string | undefined;
+  yield* Effect.forEach(
+    ordered,
+    (testCase) =>
+      runCase(testCase).pipe(
+        Effect.flatMap((caseRows) => {
+          rows.push(...caseRows);
+          if (!stopEarly || !passedBefore(testCase.id) || passRate(caseRows) > 0.5) {
+            return Effect.void;
+          }
+          regression = testCase.id;
+          return Effect.fail(testCase.id);
+        }),
+      ),
+    { concurrency: flags.concurrency, discard: true },
+  ).pipe(Effect.catch(() => Effect.void));
   const commit = NodeChildProcess.execFileSync("git", ["describe", "--always", "--dirty"], {
     encoding: "utf8",
   }).trim();
   const samples = flags.samples === undefined ? "2-3 (adaptive)" : flags.samples;
   const header = `Commit \`${commit}\`, ${MODEL} at ${flags.effort} effort, user instructions ${flags["user-instructions"]}, ${samples} samples per case, template \`${path.basename(flags.template)}\``;
+  const stopped =
+    regression === undefined
+      ? []
+      : [
+          `- Stopped at the first regression: \`${regression}\` passed in the baseline and now fails. ${new Set(rows.map((row) => row.id)).size} of ${selected.length} cases finished.`,
+        ];
   const summary = summarize(
     rows,
-    { header, shellModel: config.shellModel },
+    { header: [header, t3ContextReport(), ...stopped].join("\n"), shellModel: config.shellModel },
     flags.baseline === undefined ? undefined : baseline,
   );
   yield* fs.makeDirectory(out, { recursive: true });
