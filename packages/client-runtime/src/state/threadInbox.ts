@@ -239,3 +239,37 @@ export function createInboxReturnTracker() {
     returnedAt: (thread: ThreadKeyInput) => returns.get(keyOf(thread)),
   };
 }
+
+export function threadDecisionReasons(
+  thread: Pick<
+    EnvironmentThreadShell,
+    | "hasPendingApprovals"
+    | "hasPendingUserInput"
+    | "source"
+    | "pendingSubagentRequest"
+    | "hasActionableProposedPlan"
+    | "interactionMode"
+  >,
+): readonly string[] {
+  const reasons: string[] = [];
+  if (thread.hasPendingApprovals) reasons.push("Approval requested");
+  if (thread.source.pendingRuntimeRequest?.kind === "user_input" || thread.hasPendingUserInput)
+    reasons.push("Question to answer");
+  if (thread.pendingSubagentRequest === "approval") reasons.push("Subagent approval requested");
+  if (thread.pendingSubagentRequest === "user_input") reasons.push("Subagent question to answer");
+  if (thread.interactionMode === "plan" && thread.hasActionableProposedPlan) {
+    reasons.push("Plan to review");
+  }
+  return reasons;
+}
+
+export function decisionInboxThreads<T extends EnvironmentThreadShell>(threads: readonly T[]): T[] {
+  return sortInboxThreadsByReturn(
+    threads.filter(
+      (thread) =>
+        thread.archivedAt === null &&
+        thread.deletedAt === null &&
+        threadDecisionReasons(thread).length > 0,
+    ),
+  );
+}
