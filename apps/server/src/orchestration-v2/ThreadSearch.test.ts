@@ -6,6 +6,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   type OrchestrationV2DomainEvent,
+  type ThreadLinkedPullRequest,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DateTime from "effect/DateTime";
@@ -66,6 +67,8 @@ const thread = (
     readonly subagentOf?: ThreadId;
     readonly title?: string;
     readonly settledAt?: DateTime.Utc;
+    readonly linkedPullRequest?: ThreadLinkedPullRequest;
+    readonly branchPullRequest?: ThreadLinkedPullRequest;
   } = {},
 ): OrchestrationV2DomainEvent => ({
   id: EventId.make(`created:${threadId}`),
@@ -85,6 +88,8 @@ const thread = (
     interactionMode: "default",
     branch: null,
     worktreePath: null,
+    linkedPullRequest: overrides.linkedPullRequest ?? null,
+    branchPullRequest: overrides.branchPullRequest ?? null,
     activeProviderThreadId: null,
     lineage: overrides.subagentOf
       ? {
@@ -713,6 +718,47 @@ it.layer(layerTest)("ThreadSearch.searchOlderSettled", (it) => {
         }),
         id("note"),
       );
+    }),
+  );
+
+  it.effect("matches the branch and linked pull requests, like the palette", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const search = yield* ThreadSearch.ThreadSearch;
+      const project = ProjectId.make("project:heron");
+      yield* createProject(project);
+      const pullRequest = (number: number): ThreadLinkedPullRequest => ({
+        projectId: project,
+        repository: "acme/heron",
+        number,
+        url: `https://github.com/acme/heron/pull/${number}`,
+      });
+      const branch = ThreadId.make("thread:heron-branch");
+      const linked = ThreadId.make("thread:heron-linked");
+      yield* Effect.forEach(
+        [
+          thread(branch, project, {
+            title: "Heron",
+            settledAt: at(10),
+            branchPullRequest: pullRequest(4101),
+          }),
+          thread(linked, project, {
+            title: "Heron",
+            settledAt: at(10),
+            linkedPullRequest: pullRequest(4202),
+          }),
+        ],
+        projections.apply,
+        { discard: true },
+      );
+      const find = (query: string) =>
+        search.searchOlderSettled({
+          query,
+          before: DateTime.formatIso(at(30)),
+          messageThreadIds: [],
+        });
+      assert.deepEqual(yield* find("#4101"), [branch]);
+      assert.deepEqual(yield* find("acme/heron#4202"), [linked]);
     }),
   );
 });

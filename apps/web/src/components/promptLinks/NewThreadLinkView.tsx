@@ -1,8 +1,9 @@
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { getCloneDestinationPath } from "@t3tools/client-runtime/operations/projects";
 import {
-  findPromptLinkProject,
+  findPromptLinkProjects,
   findPromptLinkPullRequestThread,
+  pickPromptLinkPullRequestThread,
   resolvePromptLinkModelSelection,
 } from "@t3tools/client-runtime/prompt-links";
 import {
@@ -10,6 +11,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
+import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import {
   type NewThreadLink,
   type PromptLinkRepository,
@@ -17,6 +19,7 @@ import {
 } from "@t3tools/shared/promptLinks";
 import { useAtomValue } from "@effect/atom-react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
+import { Atom } from "effect/reactivity";
 import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { useComposerDraftStore } from "~/composerDraftStore";
@@ -28,10 +31,9 @@ import { useProjects, useThreadShells, waitForProject } from "~/state/entities";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { useEnvironments, usePrimaryEnvironmentId } from "~/state/environments";
 import { environmentPresentations } from "~/state/presentation";
-import { allReachableShellsLiveAtom } from "~/state/shell";
+import { allReachableShellsLiveAtom, environmentShell } from "~/state/shell";
 import { sourceControlEnvironment } from "~/state/sourceControl";
 import { pullRequestEnvironment } from "~/state/pullRequests";
-import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
 
 import { usePullRequestHandoffs } from "../pullRequest/usePullRequestActions";
@@ -63,6 +65,36 @@ type LinkLaunch =
   | { readonly kind: "settled" };
 
 const openedLinkKeys = new Set<string>();
+
+type PullRequestThreadLookup = {
+  readonly targets: ReadonlyArray<readonly [environmentId: EnvironmentId, projectId: ProjectId]>;
+  readonly repository: string;
+  readonly number: number;
+};
+
+// A pull request's thread can be an older settled thread no shell holds, so ask every
+// environment with the repository.
+const pullRequestThreadLookupAtom = Atom.family((key: string) => {
+  const { targets, repository, number } = JSON.parse(key) as PullRequestThreadLookup;
+  return Atom.make((get) =>
+    pickPromptLinkPullRequestThread(
+      targets
+        // A shell that is not live cannot answer, and its lookup would wait forever.
+        .filter(([environmentId]) => get(environmentShell.statusAtom(environmentId)) === "live")
+        .map(([environmentId, projectId]) => ({
+          environmentId,
+          result: get(
+            pullRequestEnvironment.linkedThreads({
+              environmentId,
+              input: { projectId, repository, number },
+            }),
+          ),
+        })),
+    ),
+  ).pipe(Atom.withLabel(`web-prompt-link-pull-request-thread:${key}`));
+});
+
+const NO_PULL_REQUEST_THREAD_LOOKUP = Atom.make(null);
 
 export function NewThreadLinkView({ link }: { readonly link: NewThreadLink }) {
   const locationKey = useLocation({ select: (location) => location.state.__TSR_key ?? "" });
@@ -223,41 +255,32 @@ export function NewThreadLinkView({ link }: { readonly link: NewThreadLink }) {
     await openDraft(project);
   };
 
-  // A pull request's thread can be an older settled thread the shell left out; the server knows.
   const localPullRequestThread =
     ready && link.kind === "pull-request"
       ? findPromptLinkPullRequestThread(threads, link.pullRequest)
       : undefined;
-  const pullRequestProject =
+  const lookupProjects =
     ready && link.kind === "pull-request" && localPullRequestThread === undefined
-      ? findPromptLinkProject(recentProjects(), link.pullRequest)
-      : undefined;
-  const linkedThreads = useEnvironmentQuery(
-    pullRequestProject === undefined || link.kind !== "pull-request"
-      ? null
-      : pullRequestEnvironment.linkedThreads({
-          environmentId: pullRequestProject.environmentId,
-          input: {
-            projectId: pullRequestProject.id,
+      ? findPromptLinkProjects(recentProjects(), link.pullRequest)
+      : [];
+  const serverPullRequestThread = useAtomValue(
+    link.kind === "pull-request" && lookupProjects.length > 0
+      ? pullRequestThreadLookupAtom(
+          JSON.stringify({
+            targets: lookupProjects.map((project) => [project.environmentId, project.id]),
             repository: `${link.pullRequest.owner}/${link.pullRequest.name}`,
             number: link.pullRequest.number,
-          },
-        }),
+          } satisfies PullRequestThreadLookup),
+        )
+      : NO_PULL_REQUEST_THREAD_LOOKUP,
   );
-  const linkedThread = linkedThreads.data?.threads.find((thread) => thread.archivedAt === null);
-  const linkedThreadsDone =
-    pullRequestProject === undefined || linkedThreads.data !== null || linkedThreads.error !== null;
 
-  if (ready && linkedThreadsDone && state.status === "opening" && !started) {
+  if (ready && serverPullRequestThread !== undefined && state.status === "opening" && !started) {
     setStarted(true);
-    const pullRequestThread =
-      localPullRequestThread ??
-      (linkedThread === undefined || pullRequestProject === undefined
-        ? undefined
-        : { environmentId: pullRequestProject.environmentId, id: linkedThread.id });
+    const pullRequestThread = localPullRequestThread ?? serverPullRequestThread ?? undefined;
     const repository = link.kind === "new" ? link.repository : link.pullRequest;
     const project =
-      repository === null ? undefined : findPromptLinkProject(recentProjects(), repository);
+      repository === null ? undefined : findPromptLinkProjects(recentProjects(), repository)[0];
     if (pullRequestThread !== undefined) {
       setState({ status: "opened" });
       setLaunch({ kind: "thread", thread: pullRequestThread });

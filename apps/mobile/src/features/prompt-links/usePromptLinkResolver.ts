@@ -2,7 +2,7 @@ import * as Dialog from "../../components/ui/Dialog";
 import { StackActions, useNavigation } from "@react-navigation/native";
 import { availableScratchWorkspaceRoot } from "@t3tools/client-runtime/operations/projects";
 import {
-  findPromptLinkProject,
+  findPromptLinkProjects,
   findPromptLinkPullRequestThread,
   resolvePromptLinkModelSelection,
 } from "@t3tools/client-runtime/prompt-links";
@@ -111,26 +111,40 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
     }
   };
 
+  // A pull request's thread can be an older settled thread no shell holds, so ask every
+  // connected environment with the repository. A lookup on another one would wait forever.
+  const findServerPullRequestThread = async (
+    projects: ReadonlyArray<EnvironmentProject>,
+    pullRequest: PromptLinkPullRequest,
+  ) => {
+    const connected = new Set(
+      connectedEnvironments
+        .filter((environment) => environment.connectionState === "connected")
+        .map((environment) => environment.environmentId),
+    );
+    const found = await Promise.all(
+      projects
+        .filter((project) => connected.has(project.environmentId))
+        .map(async (project) => {
+          const linked = await loadLinkedThreads({
+            environmentId: project.environmentId,
+            input: {
+              projectId: project.id,
+              repository: promptLinkRepositoryName(pullRequest),
+              number: pullRequest.number,
+            },
+          });
+          const thread =
+            linked._tag === "Success"
+              ? linked.value.threads.find((candidate) => candidate.archivedAt === null)
+              : undefined;
+          return thread && { environmentId: project.environmentId, id: thread.id };
+        }),
+    );
+    return found.find((thread) => thread !== undefined);
+  };
+
   const openProjectDraft = async (project: EnvironmentProject, request: LinkedDraftRequest) => {
-    if (request.pullRequest) {
-      // The pull request's thread can be an older settled thread the shell left out.
-      const linked = await loadLinkedThreads({
-        environmentId: project.environmentId,
-        input: {
-          projectId: project.id,
-          repository: promptLinkRepositoryName(request.pullRequest),
-          number: request.pullRequest.number,
-        },
-      });
-      const thread =
-        linked._tag === "Success"
-          ? linked.value.threads.find((candidate) => candidate.archivedAt === null)
-          : undefined;
-      if (thread) {
-        openThread({ environmentId: project.environmentId, id: thread.id }, request.prompt);
-        return;
-      }
-    }
     try {
       await waitForComposerDraftsLoaded();
     } catch {
@@ -292,14 +306,20 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
     }
     const activityOf = (project: EnvironmentProject) =>
       lastActivity.get(`${project.environmentId}:${project.id}`) ?? "";
-    const project = findPromptLinkProject(
+    const projects = findPromptLinkProjects(
       flow.projectScopes
         .flatMap((scope) => scope.projects)
         .sort((left, right) => activityOf(right).localeCompare(activityOf(left))),
       repository,
     );
+    const project = projects[0];
     if (project) {
-      void openProjectDraft(project, request);
+      const { pullRequest } = request;
+      void (async () => {
+        const thread = pullRequest && (await findServerPullRequestThread(projects, pullRequest));
+        if (thread) openThread(thread, request.prompt);
+        else await openProjectDraft(project, request);
+      })();
       return;
     }
     Dialog.alert(`You don't have ${promptLinkRepositoryName(repository)}`, undefined, [
