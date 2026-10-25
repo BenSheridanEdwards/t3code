@@ -1489,6 +1489,10 @@ const summarize = (
 };
 
 const PositiveInt = Schema.FiniteFromString.check(Schema.isInt(), Schema.isGreaterThan(0));
+const PositiveIntOrZero = Schema.FiniteFromString.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0),
+);
 const Flags = Schema.Struct({
   model: Schema.Literals([MODEL, SOL]),
   template: Schema.String,
@@ -1504,6 +1508,7 @@ const Flags = Schema.Struct({
   "user-instructions": Schema.Literals(["keep", "drop"]),
   "dry-run": Schema.Boolean,
   "stop-on-regression": Schema.Boolean,
+  "regression-budget": Schema.optional(PositiveIntOrZero),
   context: Schema.Boolean,
 });
 const decodeFlags = Schema.decodeUnknownEffect(Flags);
@@ -1536,6 +1541,7 @@ const main = Effect.gen(function* () {
       "user-instructions": { ...string, default: "drop" },
       "dry-run": { type: "boolean", default: false },
       "stop-on-regression": { type: "boolean", default: false },
+      "regression-budget": string,
       // Prints the size of T3's text and tool schemas, then exits. Needs no template or key.
       context: { type: "boolean", default: false },
     },
@@ -1620,8 +1626,8 @@ const main = Effect.gen(function* () {
   const previous =
     flags.baseline === undefined ? [] : yield* readJsonl(flags.baseline, decodeBaselineRow);
   const baseline = new Map(groups(previous, (row) => row.id).map(([id, r]) => [id, passRate(r)]));
-  // A case passes when most of its samples pass.
-  const passedBefore = (id: string) => (baseline.get(id) ?? 0) > 0.5;
+  // Only a case that passed every baseline sample can stop a run; flaky ones are just reported.
+  const passedBefore = (id: string) => baseline.get(id) === 1;
   const runOne = (testCase: McpToolUseCase) => {
     const { id, kind, pattern } = testCase;
     const identity = { id, kind, pattern, role: testCase.setup.role };
@@ -1655,14 +1661,16 @@ const main = Effect.gen(function* () {
     const split = flags.samples === undefined && new Set(first.map((row) => row.pass)).size > 1;
     return split ? [...first, yield* runOne(testCase)] : first;
   });
-  // --stop-on-regression runs cases that passed in the baseline first and stops at the first
-  // one that now fails, so a copy change that breaks a passing case fails fast.
+  // --stop-on-regression runs cases that passed in the baseline first and stops once more than
+  // --regression-budget of them fail, so a copy change that breaks passing cases fails fast.
+  // A budget lets a quirky model miss a case or two without ending the run.
   const stopEarly = flags["stop-on-regression"];
+  const budget = flags["regression-budget"] ?? 0;
   const ordered = stopEarly
     ? selected.toSorted((a, b) => Number(passedBefore(b.id)) - Number(passedBefore(a.id)))
     : selected;
   const rows: Array<Effect.Success<ReturnType<typeof runOne>>> = [];
-  let regression: string | undefined;
+  const regressions: Array<string> = [];
   yield* Effect.forEach(
     ordered,
     (testCase) =>
@@ -1672,8 +1680,8 @@ const main = Effect.gen(function* () {
           if (!stopEarly || !passedBefore(testCase.id) || passRate(caseRows) > 0.5) {
             return Effect.void;
           }
-          regression = testCase.id;
-          return Effect.fail(testCase.id);
+          regressions.push(testCase.id);
+          return regressions.length > budget ? Effect.fail(testCase.id) : Effect.void;
         }),
       ),
     { concurrency: flags.concurrency, discard: true },
@@ -1683,11 +1691,12 @@ const main = Effect.gen(function* () {
   }).trim();
   const samples = flags.samples === undefined ? "2-3 (adaptive)" : flags.samples;
   const header = `Commit \`${commit}\`, ${flags.model} at ${effort} effort, user instructions ${flags["user-instructions"]}, ${samples} samples per case, template \`${path.basename(templatePath)}\``;
+  const finished = new Set(rows.map((row) => row.id)).size;
   const stopped =
-    regression === undefined
+    regressions.length === 0
       ? []
       : [
-          `- Stopped at the first regression: \`${regression}\` passed in the baseline and now fails. ${new Set(rows.map((row) => row.id)).size} of ${selected.length} cases finished.`,
+          `- Regressions (passed every baseline sample, now fail): ${regressions.map((id) => `\`${id}\``).join(", ")}.${regressions.length > budget ? ` Stopped with ${finished} of ${selected.length} cases finished.` : ""}`,
         ];
   const summary = summarize(
     rows,
