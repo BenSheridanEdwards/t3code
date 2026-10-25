@@ -45,6 +45,19 @@ it("grades Codex shell and subagent calls with the shared rules", () => {
   );
 });
 
+it("accepts any tool listed as an alternative", () => {
+  const expect = { calls: [{ tool: "link_pull_request|watch_pull_request" }] };
+  const run = (tool: string): SampleRun => ({
+    calls: [{ step: 0, tool, input: {} }],
+    text: "",
+    stopReason: "end_turn",
+  });
+  assert.deepEqual(failed(expect, run("watch_pull_request")), []);
+  assert.deepEqual(failed(expect, run("list_thread_pull_requests")), [
+    "calls link_pull_request|watch_pull_request",
+  ]);
+});
+
 it("runs code-mode calls without exposing host capabilities, including after await", async () => {
   const catalog = [{ name: "mock", description: "mock" }];
   const result = await executeCodex(
