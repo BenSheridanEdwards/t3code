@@ -42,7 +42,7 @@ describe("findPromptLinkProjects", () => {
 });
 
 describe("pickPromptLinkPullRequestThread", () => {
-  it("waits for every fresh answer, then takes the first open thread", () => {
+  it("takes the first open thread in order once every earlier lookup has answered", () => {
     const laptop = EnvironmentId.make("laptop");
     const server = EnvironmentId.make("server");
     const linked = (
@@ -61,6 +61,12 @@ describe("pickPromptLinkPullRequestThread", () => {
     // A value shown while it refetches is not an answer yet.
     expect(pick(AsyncResult.success(none, { waiting: true }))).toBeUndefined();
     expect(pick(AsyncResult.success(none), AsyncResult.initial(true))).toBeUndefined();
+    expect(pick(AsyncResult.initial(true), AsyncResult.success(linked("b")))).toBeUndefined();
+    const laptopThread = { environmentId: laptop, id: ThreadId.make("a") };
+    expect(pick(AsyncResult.success(linked("a")), AsyncResult.initial(true))).toEqual(laptopThread);
+    expect(pick(AsyncResult.success(linked("a")), AsyncResult.success(linked("b")))).toEqual(
+      laptopThread,
+    );
     expect(pick(AsyncResult.success(none), AsyncResult.success(linked("old")))).toEqual({
       environmentId: server,
       id: ThreadId.make("old"),

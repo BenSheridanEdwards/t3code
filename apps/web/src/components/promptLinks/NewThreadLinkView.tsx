@@ -259,8 +259,13 @@ export function NewThreadLinkView({ link }: { readonly link: NewThreadLink }) {
     ready && link.kind === "pull-request"
       ? findPromptLinkPullRequestThread(threads, link.pullRequest)
       : undefined;
+  // Mounted only while deciding, so "Open it again" asks the server again.
   const lookupProjects =
-    ready && link.kind === "pull-request" && localPullRequestThread === undefined
+    ready &&
+    state.status === "opening" &&
+    !started &&
+    link.kind === "pull-request" &&
+    localPullRequestThread === undefined
       ? findPromptLinkProjects(recentProjects(), link.pullRequest)
       : [];
   const serverPullRequestThread = useAtomValue(

@@ -122,26 +122,29 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
         .filter((environment) => environment.connectionState === "connected")
         .map((environment) => environment.environmentId),
     );
-    const found = await Promise.all(
-      projects
-        .filter((project) => connected.has(project.environmentId))
-        .map(async (project) => {
-          const linked = await loadLinkedThreads({
-            environmentId: project.environmentId,
-            input: {
-              projectId: project.id,
-              repository: promptLinkRepositoryName(pullRequest),
-              number: pullRequest.number,
-            },
-          });
-          const thread =
-            linked._tag === "Success"
-              ? linked.value.threads.find((candidate) => candidate.archivedAt === null)
-              : undefined;
-          return thread && { environmentId: project.environmentId, id: thread.id };
-        }),
-    );
-    return found.find((thread) => thread !== undefined);
+    const lookups = projects
+      .filter((project) => connected.has(project.environmentId))
+      .map(async (project) => {
+        const linked = await loadLinkedThreads({
+          environmentId: project.environmentId,
+          input: {
+            projectId: project.id,
+            repository: promptLinkRepositoryName(pullRequest),
+            number: pullRequest.number,
+          },
+        });
+        const thread =
+          linked._tag === "Success"
+            ? linked.value.threads.find((candidate) => candidate.archivedAt === null)
+            : undefined;
+        return thread && { environmentId: project.environmentId, id: thread.id };
+      });
+    // The most recent project wins without waiting for the lookups after it.
+    for (const lookup of lookups) {
+      const thread = await lookup;
+      if (thread) return thread;
+    }
+    return undefined;
   };
 
   const openProjectDraft = async (project: EnvironmentProject, request: LinkedDraftRequest) => {

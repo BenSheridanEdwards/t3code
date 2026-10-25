@@ -60,8 +60,8 @@ export function findPromptLinkPullRequestThread<
 }
 
 /**
- * The first open thread from per-environment pull request lookups, in the order given. `null`
- * when none has one; `undefined` until every lookup has answered.
+ * The first open thread from per-environment pull request lookups, in the order given, once
+ * every lookup before it has answered. `null` when none has one; `undefined` until then.
  */
 export function pickPromptLinkPullRequestThread(
   lookups: ReadonlyArray<{
@@ -69,16 +69,15 @@ export function pickPromptLinkPullRequestThread(
     readonly result: AsyncResult.AsyncResult<PullRequestLinkedThreadsResult, unknown>;
   }>,
 ): { readonly environmentId: EnvironmentId; readonly id: ThreadId } | null | undefined {
-  let found: { readonly environmentId: EnvironmentId; readonly id: ThreadId } | null = null;
   for (const { environmentId, result } of lookups) {
     if (result._tag === "Initial" || result.waiting) return undefined;
     const thread =
       result._tag === "Success"
         ? result.value.threads.find((candidate) => candidate.archivedAt === null)
         : undefined;
-    if (found === null && thread !== undefined) found = { environmentId, id: thread.id };
+    if (thread !== undefined) return { environmentId, id: thread.id };
   }
-  return found;
+  return null;
 }
 
 const PROVIDER_ALIASES: Record<string, string> = { claude: "claudeagent" };
