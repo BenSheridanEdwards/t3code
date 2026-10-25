@@ -233,8 +233,14 @@ export function V5StackHeader(props: {
       trailing.push({ type: "spacer", id: "compose-group", sizing: "fixed", width: 8 });
     trailing.push(compose);
   }
-  // The vertical bar has no keyboard accessory row, so it carries its own dismiss.
-  if (keyboardVisible && nativeMetrics && nativeMetrics.verticalBarEdge !== "none") {
+  // The vertical bar has no keyboard accessory row, so it carries its own dismiss. A regular-width
+  // primary column draws a horizontal bar beside the detail column's vertical one.
+  if (
+    keyboardVisible &&
+    nativeMetrics &&
+    nativeMetrics.verticalBarEdge !== "none" &&
+    (props.column !== "primary" || nativeMetrics.horizontalSizeClass === "compact")
+  ) {
     if (trailing.length)
       trailing.push({ type: "spacer", id: "dismiss-keyboard-group", sizing: "fixed", width: 8 });
     trailing.push({
