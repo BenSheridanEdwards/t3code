@@ -151,6 +151,8 @@ export const McpToolUseCase = Schema.Struct({
   privacy: Schema.optional(Schema.Literals(["commit-safe", "private"])),
   setup: Schema.Struct({
     role: Schema.Literals(["top", "delegated-child", "native-subagent"]),
+    /** Runs only on this harness, for cases whose right answer depends on it. */
+    harness: Schema.optional(Schema.Literals(["claude", "codex"])),
     /** delegate_task `role` for a delegated child. T3 builds the child's first message from it. */
     delegateRole: Schema.optional(OrchestratorMcpTaskRole),
     context: Schema.optional(Schema.String),
@@ -1319,7 +1321,10 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
   const said: Array<string> = [];
   const usage = emptyUsage();
   let stopReason = "max_steps";
-  for (let step = 0; step < (testCase.maxSteps ?? config.maxSteps); step++) {
+  // Sol's code-mode cells take more model calls, so a case's own budget grows for it too.
+  const extra = config.model === SOL ? 4 : 0;
+  const maxSteps = testCase.maxSteps === undefined ? config.maxSteps : testCase.maxSteps + extra;
+  for (let step = 0; step < maxSteps; step++) {
     const response = input
       ? yield* callCodex(config, codexRequest(base, input))
       : yield* callModel(config.apiKey, requestBody(sample, config.effort, messages));
@@ -1559,7 +1564,12 @@ const main = Effect.gen(function* () {
       .map((name) => path.join(casesDir, name));
   const cases = (yield* Effect.forEach(caseFiles, (file) => readJsonl(file, decodeCase))).flat();
   const wanted = flags.case?.flatMap((ids) => ids.split(","));
-  const selected = cases.filter(({ id }) => wanted === undefined || wanted.includes(id));
+  const harness = flags.model === SOL ? "codex" : "claude";
+  const selected = cases.filter(
+    ({ id, setup }) =>
+      (wanted === undefined || wanted.includes(id)) &&
+      (setup.harness === undefined || setup.harness === harness),
+  );
   if (selected.length === 0) return yield* Effect.die(new Error("No case matches --case."));
   const templatePath =
     flags.template ||
