@@ -7,6 +7,7 @@ import {
 import { useEnvironments } from "../../state/environments";
 import { useProjects, useQuietThreadShells } from "../../state/entities";
 import { Button } from "../ui/button";
+import { useSidebar } from "../ui/sidebar";
 import {
   Dialog,
   DialogTrigger,
@@ -19,6 +20,7 @@ import {
 
 export function DecisionInbox() {
   const [open, setOpen] = useState(false);
+  const { isMobile, setOpenMobile } = useSidebar();
   const threads = useQuietThreadShells();
   const projects = useProjects();
   const { environments } = useEnvironments();
@@ -58,7 +60,10 @@ export function DecisionInbox() {
                     <Link
                       to="/$environmentId/$threadId"
                       params={{ environmentId: thread.environmentId, threadId: thread.id }}
-                      onClick={() => setOpen(false)}
+                      onClick={() => {
+                        setOpen(false);
+                        if (isMobile) setOpenMobile(false);
+                      }}
                       className="block rounded-lg border p-3 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
                     >
                       <div className="text-sm font-medium">{thread.title}</div>
