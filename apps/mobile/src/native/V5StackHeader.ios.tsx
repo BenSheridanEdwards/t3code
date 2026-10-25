@@ -234,22 +234,26 @@ export function V5StackHeader(props: {
     trailing.push(compose);
   }
   // The vertical bar has no keyboard accessory row, so it carries its own dismiss. A regular-width
-  // primary column draws a horizontal bar beside the detail column's vertical one.
+  // primary column draws a horizontal bar beside the detail column's vertical one. The first
+  // trailing item sits at the bar's far end; the flexible space keeps it next to the keyboard.
   if (
     keyboardVisible &&
     nativeMetrics &&
     nativeMetrics.verticalBarEdge !== "none" &&
     (props.column !== "primary" || nativeMetrics.horizontalSizeClass === "compact")
   ) {
-    if (trailing.length)
-      trailing.push({ type: "spacer", id: "dismiss-keyboard-group", sizing: "fixed", width: 8 });
-    trailing.push({
-      type: "item",
-      id: "dismiss-keyboard",
-      title: "Dismiss keyboard",
-      icon: { type: "sfSymbol", name: "keyboard.chevron.compact.down" },
-      onPress: () => void KeyboardController.dismiss(),
-    });
+    trailing.unshift(
+      {
+        type: "item",
+        id: "dismiss-keyboard",
+        title: "Dismiss keyboard",
+        icon: { type: "sfSymbol", name: "keyboard.chevron.compact.down" },
+        onPress: () => void KeyboardController.dismiss(),
+        // The folded bar is short; keep this out of the overflow menu.
+        visibilityPriority: "high",
+      },
+      { type: "spacer", id: "dismiss-keyboard-space", sizing: "flexible" },
+    );
   }
   const left = options.headerLeft?.(itemProps);
   const right = options.headerRight?.(itemProps);
