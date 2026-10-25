@@ -59,6 +59,11 @@ const TOOL_LOADED = "Tool loaded.";
 const DEFERRED_LIST =
   /(The following deferred tools are now available via ToolSearch\.[^\n]*\n)((?:[^\n]+\n)*)/;
 const MODEL_LINE = /You are powered by the model named .+?\. The exact model ID is [\w.-]+\./;
+// API keys can be billed differently for requests that open with Claude Code's identity line,
+// so every copy of it becomes a neutral line. The rest of the captured prompt is unchanged.
+const IDENTITY =
+  /You are Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?\./g;
+const NEUTRAL_IDENTITY = "You are an AI coding agent running in the user's terminal.";
 
 type Block = { readonly type: string; readonly [key: string]: unknown };
 type ApiMessage = { readonly role: "user" | "assistant"; readonly content: ReadonlyArray<Block> };
@@ -318,7 +323,8 @@ export const buildBase = (
     const at = value.indexOf(RUNTIME_MARKER);
     return anonymize(at === -1 ? value : value.slice(0, at) + append)
       .replace(DEFERRED_LIST, (_, header: string) => `${header}${names}\n`)
-      .replace(MODEL_LINE, sonnet);
+      .replace(MODEL_LINE, sonnet)
+      .replace(IDENTITY, NEUTRAL_IDENTITY);
   });
   const [first] = template.messages;
   // The last block is the captured prompt.
@@ -1005,6 +1011,7 @@ const summarize = (
   ];
   const nativeNote =
     "- native-subagent cases are approximate: Claude Code gives Agent subagents their own system prompt, which this runner does not rebuild.";
+  const identityNote = `- The captured Claude Code identity line is replaced with "${NEUTRAL_IDENTITY}"`;
   return [
     "# MCP tool-use eval\n",
     `- ${options.header}`,
@@ -1012,6 +1019,7 @@ const summarize = (
     `- Estimated cost $${cost.toFixed(2)}, $${(cost / rows.length).toFixed(3)} per sample.`,
     `- Agent tokens: ${agent.tokens} ($${agent.cost.toFixed(2)}).`,
     `- Shell simulator (${options.shellModel}) tokens: ${shell.tokens} ($${shell.cost.toFixed(2)}).`,
+    identityNote,
     ...(rows.some((row) => row.role === "native-subagent") ? [nativeNote] : []),
     "",
     ...table("Cases", (row) => row.id, before !== undefined),
