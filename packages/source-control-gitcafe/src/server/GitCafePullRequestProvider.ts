@@ -522,6 +522,43 @@ export const make = Effect.gen(function* () {
     return { ...stack, members };
   });
 
+  const readDiffPage = Effect.fn("GitCafePullRequestProvider.readDiffPage")(function* (
+    operation: string,
+    input: Parameters<PullRequestProviderApi["getDiff"]>[0],
+    limit: number,
+  ) {
+    if (input.commit !== undefined)
+      return yield* failure(operation, "GitCafe commit diffs are not supported yet.");
+    const cursor =
+      input.cursor === undefined
+        ? null
+        : yield* decodeDiffCursor(input.cursor).pipe(
+            Effect.mapError((cause) => failure(operation, "Invalid GitCafe diff cursor.", cause)),
+          );
+    const pull = cursor === null ? yield* readPull(operation, input) : null;
+    const version = cursor?.version ?? pull!.version;
+    const headOid = cursor?.headOid ?? pull!.headOid;
+    const path = yield* pullPath(operation, input);
+    const query = new URLSearchParams({ expectedVersion: String(version), limit: String(limit) });
+    if (cursor !== null) query.set("after", cursor.after);
+    const page = yield* read(operation, input, { path: `${path}/changes?${query}` }, Changes);
+    if (
+      page.version !== version ||
+      page.headOid !== headOid ||
+      (cursor !== null && cursor.baseOid !== page.comparisonBaseOid)
+    )
+      return yield* failure(
+        operation,
+        "GitCafe answered from a different revision of the pull request. Refresh the diff.",
+      );
+    const revision = { version, headOid: page.headOid, baseOid: page.comparisonBaseOid };
+    return {
+      items: page.items,
+      revision,
+      nextCursor: page.next === null ? null : encodeDiffCursor({ ...revision, after: page.next }),
+    };
+  });
+
   const readDiffFiles = Effect.fn("GitCafePullRequestProvider.readDiffFiles")(function* (
     input: PullRef,
     revision: { readonly version: number; readonly headOid: string; readonly baseOid: string },
@@ -966,36 +1003,21 @@ export const make = Effect.gen(function* () {
     getViewerPermissions: (input) =>
       readPull("getViewerPermissions", input).pipe(Effect.map(Json.toViewerPermissions)),
     getDiff: Effect.fn("GitCafePullRequestProvider.getDiff")(function* (input) {
-      if (input.commit !== undefined)
-        return yield* failure("getDiff", "GitCafe commit diffs are not supported yet.");
-      const cursor =
-        input.cursor === undefined
-          ? null
-          : yield* decodeDiffCursor(input.cursor).pipe(
-              Effect.mapError((cause) => failure("getDiff", "Invalid GitCafe diff cursor.", cause)),
-            );
-      const version = cursor?.version ?? (yield* readPull("getDiff", input)).version;
-      const path = yield* pullPath("getDiff", input);
-      const query = new URLSearchParams({
-        expectedVersion: String(version),
-        limit: String(DIFF_FILES_BATCH),
-      });
-      if (cursor !== null) query.set("after", cursor.after);
-      const page = yield* read("getDiff", input, { path: `${path}/changes?${query}` }, Changes);
-      if (
-        page.version !== version ||
-        (cursor !== null &&
-          (cursor.headOid !== page.headOid || cursor.baseOid !== page.comparisonBaseOid))
-      )
-        return yield* failure(
-          "getDiff",
-          "GitCafe answered from a different revision of the pull request. Refresh the diff.",
-        );
-      const revision = { version, headOid: page.headOid, baseOid: page.comparisonBaseOid };
-      const details = yield* readDiffFiles(input, revision, detailablePaths(page.items));
+      const page = yield* readDiffPage("getDiff", input, DIFF_FILES_BATCH);
+      const details = yield* readDiffFiles(input, page.revision, detailablePaths(page.items));
       return {
         ...Json.toDiff({ items: withDetails(page.items, details) }),
-        nextCursor: page.next === null ? null : encodeDiffCursor({ ...revision, after: page.next }),
+        nextCursor: page.nextCursor,
+      };
+    }),
+    getDiffFilePaths: Effect.fn("GitCafePullRequestProvider.getDiffFilePaths")(function* (input) {
+      const page = yield* readDiffPage("getDiffFilePaths", input, 500);
+      return {
+        files: page.items.map((file) => ({
+          oldPath: file.oldPath ?? file.path,
+          newPath: file.path,
+        })),
+        nextCursor: page.nextCursor,
       };
     }),
     getDiffFileContents: Effect.fn("GitCafePullRequestProvider.getDiffFileContents")(
