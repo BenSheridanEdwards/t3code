@@ -3,14 +3,17 @@ import { assert, it } from "@effect/vitest";
 import {
   buildBase,
   buildMessages,
+  failedEarly,
   gradeSample,
   makeSample,
+  type McpToolUseCase,
+  mockOutput,
   type SampleRun,
+  shellOutput,
+  shellRequest,
   t3SystemAppend,
 } from "./evaluate-mcp-tool-use.ts";
 import { taskPrompt } from "../src/mcp/OrchestratorMcpService.ts";
-import { mcpToolUseEvaluationCases } from "./mcpToolUseEvaluationCases.ts";
-import { makeWorld, runFileTool, runShell } from "./mcpToolUseWorld.ts";
 
 const failed = (expect: Parameters<typeof gradeSample>[0], run: SampleRun) =>
   gradeSample(expect, run)
@@ -114,7 +117,7 @@ const template = {
     {
       role: "system",
       content:
-        "Main prompt.\n\n<runtime_info>old</runtime_info>\n\n## T3 Code orchestration\nold text",
+        "Main prompt.\n - Primary working directory: /home/alice/app\n\n<runtime_info>old</runtime_info>\n\n## T3 Code orchestration\nold text",
     },
     {
       role: "system",
@@ -130,88 +133,86 @@ const template = {
   ],
 };
 
+const childCase: McpToolUseCase = {
+  id: "child-links-its-pr",
+  area: "pull-requests",
+  kind: "guard",
+  pattern: "delegated child watches PR",
+  experience: "A delegated child must link its PR and report back, not watch it.",
+  setup: {
+    role: "delegated-child",
+    delegateRole: "implementation",
+    world: { branch: "fix/date-format", files: { "src/date.ts": "export const format = 1;\n" } },
+    priorTurns: [
+      {
+        role: "assistant",
+        toolCalls: [{ tool: "Bash", input: { command: "git push" }, result: "pushed" }],
+      },
+    ],
+    shellMocks: [{ match: "^gh pr create", output: "https://github.com/acme/app/pull/124" }],
+  },
+  prompt: "Push the fix, open a PR against main, and report the PR URL.",
+  expect: { calls: [{ tool: "link_pull_request" }], notCalls: ["watch_pull_request"] },
+};
+
 it("rebuilds the template from this checkout and sends a child T3's task prompt", () => {
   const base = buildBase(template, { keepUserInstructions: false });
   const system = base.system.map((block) => String(block.text));
   assert.deepEqual(system.slice(0, 2), [
     "You are Claude Code.",
-    `Main prompt.\n\n${t3SystemAppend()}`,
+    `Main prompt.\n - Primary working directory: /home/user/app\n\n${t3SystemAppend()}`,
   ]);
+  assert.equal(base.environment.cwd, "/home/user/app");
   assert.include(system[2], "model named Sonnet 5.5. The exact model ID is claude-sonnet-5-5.");
   const deferred = system[2]?.split("Load them first:\n")[1]?.split("\n\n")[0]?.split("\n") ?? [];
   assert.includeMembers(deferred, ["Monitor", "mcp__t3-code__delegate_task"]);
   assert.notInclude(deferred, "mcp__t3-code__retired_tool");
-  assert.deepEqual(
-    base.reminders.map((block) => block.text),
-    ["<system-reminder>\n# currentDate\n</system-reminder>"],
-  );
+  const reminders = buildMessages(makeSample(childCase, base))[0]?.content.map((b) => b.text);
+  assert.equal(reminders?.[0], "<system-reminder>\n# currentDate\n</system-reminder>");
+  assert.include(reminders?.[1], "Current branch: fix/date-format");
+  assert.notInclude(reminders?.join(), "Codebase and user instructions");
 
-  const child = mcpToolUseEvaluationCases.find(
-    (testCase) => testCase.id === "delegated-child-does-not-watch",
-  );
-  if (child === undefined) throw new Error("Missing delegated child case.");
-  const prompt = buildMessages(makeSample(child, base)).at(-1)?.content.at(-1);
-  assert.equal(prompt?.text, taskPrompt({ task: child.prompt, role: "implementation" }));
-  assert.notEqual(prompt?.text, child.prompt);
+  const prompt = buildMessages(makeSample(childCase, base)).at(-1)?.content.at(-1);
+  assert.equal(prompt?.text, taskPrompt({ task: childCase.prompt, role: "implementation" }));
+  assert.notEqual(prompt?.text, childCase.prompt);
 });
 
-it("answers shell and file tools from the case's fake world", () => {
-  const world = makeWorld(
-    {
-      branch: "fix/socket",
-      branches: { "fix/base": "abc1234" },
-      commits: [
-        { sha: "def5678", subject: "fix(web): keep a healthy socket" },
-        { sha: "abc1234", subject: "fix(web): add socket state" },
-      ],
-      diff: "diff --git a/src/socket.ts b/src/socket.ts\n--- a/src/socket.ts\n+++ b/src/socket.ts\n@@ -1 +1 @@\n-old\n+new\n",
-      files: { "docs/plan.md": "# Plan\n- lane D\n" },
-      prs: [{ number: 123, title: "fix(ws): backoff", headRefName: "fix/ws-backoff" }],
-      pages: { "https://docs.acme.test": "<h1>Docs</h1>" },
-    },
-    { cwd: "/repo", platform: "linux" },
-  );
-  const mocks = [{ match: "^gh pr checks", output: "Check\tpending" }];
-  const shell = (command: string) => runShell(world, mocks, command).text;
-  assert.equal(shell("cd docs && pwd; git branch --show-current"), "/repo/docs\nfix/socket");
-  assert.equal(
-    shell("git log --oneline fix/base..HEAD | head -5"),
-    "def5678 fix(web): keep a healthy socket",
-  );
-  assert.equal(shell("git log --oneline HEAD..origin/main"), "(Bash completed with no output)");
-  assert.equal(shell("cat src/socket.ts || grep -n lane docs/plan.md"), "new");
-  assert.equal(
-    shell("cat nope.md || grep -n lane docs/plan.md"),
-    "cat: nope.md: No such file or directory\ndocs/plan.md:2:- lane D",
-  );
-  assert.equal(
-    shell("git push -u origin HEAD 2>&1 && gh pr checks"),
-    "To github.com:acme/app.git\n * [new branch]      fix/socket -> fix/socket\nCheck\tpending",
-  );
-  assert.equal(
-    shell('gh pr create --title "fix: socket" --body "a; b && c"'),
-    "https://github.com/acme/app/pull/124",
-  );
-  assert.equal(shell("gh pr view --json number,headRefName --jq .headRefName"), "fix/socket");
-  assert.equal(
-    shell("curl -s https://docs.acme.test/start -o /tmp/p.html -w '%{http_code}'; cat /tmp/p.html"),
-    "200\n<h1>Docs</h1>",
-  );
-  assert.deepEqual(runShell(world, [], "ls missing"), {
-    text: "Exit code 1\nls: cannot access 'missing': No such file or directory",
-    error: true,
-  });
+it("answers simple mocked commands itself and gives the simulator the sample's history", () => {
+  const sample = makeSample(childCase, buildBase(template, { keepUserInstructions: false }));
+  assert.equal(mockOutput(sample, "gh pr create --fill"), "https://github.com/acme/app/pull/124");
+  assert.isUndefined(mockOutput(sample, "git push && gh pr create --fill"));
+  assert.isUndefined(mockOutput(sample, "git status"));
 
-  assert.isFalse(
-    runFileTool(world, "Edit", { file_path: "docs/plan.md", old_string: "D", new_string: "E" })
-      ?.error,
-  );
+  const call = { tool: "Bash", input: { command: "git push && gh pr create --fill" } };
+  const [machine, history] =
+    shellRequest(sample, call, "claude-haiku-5-5").messages[0]?.content ?? [];
+  assert.include(machine?.text, "Working directory: /home/user/app");
+  assert.include(machine?.text, '"src/date.ts":"export const format = 1;\\n"');
+  assert.include(machine?.text, "^gh pr create");
+  assert.include(machine?.text, childCase.prompt);
   assert.equal(
-    runFileTool(world, "Read", { file_path: "/repo/docs/plan.md" })?.text,
-    "     1\t# Plan\n     2\t- lane E",
+    history?.text,
+    '<call>Bash {"command":"git push"}</call>\n<output>\npushed\n</output>\n\nNew call:\n<call>Bash {"command":"git push && gh pr create --fill"}</call>',
   );
-  assert.match(
-    shell("git commit -am 'docs: rename lane'; git status --short"),
-    /^\[fix\/socket \w{7}\] docs: rename lane/,
+});
+
+it("reads the tool output from the simulator's JSON reply", () => {
+  const reply = (value: string) => [{ type: "thinking" }, { type: "text", text: value }];
+  assert.equal(
+    shellOutput(reply('{"facts":"PR 124 is new","output":"https://x/pull/124\\n"}')),
+    "https://x/pull/124",
   );
+  assert.equal(shellOutput(reply("plain output\n")), "plain output");
+});
+
+it("stops a sample only once a must-not check has failed", () => {
+  const run = (tool: string, text = ""): SampleRun => ({
+    calls: [{ step: 0, tool, input: {} }],
+    text,
+    stopReason: "tool_use",
+  });
+  const expect = { calls: [{ tool: "link_pull_request" }], notCalls: ["watch_pull_request"] };
+  assert.isFalse(failedEarly(expect, run("Bash")));
+  assert.isTrue(failedEarly(expect, run("watch_pull_request")));
+  assert.isTrue(failedEarly({ textMustNot: ["paste"] }, run("Bash", "paste it here")));
 });
