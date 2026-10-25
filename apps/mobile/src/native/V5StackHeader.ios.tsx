@@ -4,8 +4,8 @@ import type {
   NativeStackNavigationOptions,
 } from "@react-navigation/native-stack";
 import { isValidElement, useEffect, useRef } from "react";
-import { Keyboard, StyleSheet } from "react-native";
-import { useKeyboardState } from "react-native-keyboard-controller";
+import { StyleSheet } from "react-native";
+import { KeyboardController, useKeyboardState } from "react-native-keyboard-controller";
 import { isDuoDevice } from "../lib/device-type";
 import { useMobileNavigationTheme } from "../lib/useMobileNavigationTheme";
 import { useDeviceType, useNativeLayoutMetrics } from "../native/native-layout-metrics";
@@ -242,7 +242,7 @@ export function V5StackHeader(props: {
       id: "dismiss-keyboard",
       title: "Dismiss keyboard",
       icon: { type: "sfSymbol", name: "keyboard.chevron.compact.down" },
-      onPress: Keyboard.dismiss,
+      onPress: () => void KeyboardController.dismiss(),
     });
   }
   const left = options.headerLeft?.(itemProps);
