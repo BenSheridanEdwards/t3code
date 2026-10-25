@@ -4,7 +4,8 @@ import type {
   NativeStackNavigationOptions,
 } from "@react-navigation/native-stack";
 import { isValidElement, useEffect, useRef } from "react";
-import { StyleSheet } from "react-native";
+import { Keyboard, StyleSheet } from "react-native";
+import { useKeyboardState } from "react-native-keyboard-controller";
 import { isDuoDevice } from "../lib/device-type";
 import { useMobileNavigationTheme } from "../lib/useMobileNavigationTheme";
 import { useDeviceType, useNativeLayoutMetrics } from "../native/native-layout-metrics";
@@ -153,6 +154,7 @@ export function V5StackHeader(props: {
   const theme = useMobileNavigationTheme();
   const nativeMetrics = useNativeLayoutMetrics();
   const deviceType = useDeviceType();
+  const keyboardVisible = useKeyboardState((state) => state.isVisible);
   const searchRef = useRef<SearchBarCommands>(null);
   const itemProps = { tintColor: options.headerTintColor, canGoBack: props.canGoBack };
   const leading = convertItems(options.unstable_headerLeftItems?.(itemProps) ?? [], "leading");
@@ -230,6 +232,18 @@ export function V5StackHeader(props: {
     if (trailing.length)
       trailing.push({ type: "spacer", id: "compose-group", sizing: "fixed", width: 8 });
     trailing.push(compose);
+  }
+  // The vertical bar has no keyboard accessory row, so it carries its own dismiss.
+  if (keyboardVisible && nativeMetrics && nativeMetrics.verticalBarEdge !== "none") {
+    if (trailing.length)
+      trailing.push({ type: "spacer", id: "dismiss-keyboard-group", sizing: "fixed", width: 8 });
+    trailing.push({
+      type: "item",
+      id: "dismiss-keyboard",
+      title: "Dismiss keyboard",
+      icon: { type: "sfSymbol", name: "keyboard.chevron.compact.down" },
+      onPress: Keyboard.dismiss,
+    });
   }
   const left = options.headerLeft?.(itemProps);
   const right = options.headerRight?.(itemProps);
