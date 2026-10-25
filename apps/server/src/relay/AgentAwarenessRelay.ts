@@ -434,6 +434,7 @@ export const make = Effect.gen(function* () {
     publishedRelayConfig = undefined;
     cachedRelayClient = undefined;
     publishConfirmDeadlines.clear();
+    heldCompletions.clear();
     yield* Ref.set(publishedStateByThreadRef, new Map());
   });
 
@@ -591,7 +592,17 @@ export const make = Effect.gen(function* () {
       });
       const held = heldCompletions.get(threadId);
       // Settled during the hold, not resumed: alert the completion, then clear the card on a new window.
-      if (snapshot.state === null && snapshot.reason === "snapshot" && held?.state != null) {
+      const hiddenOnlyBySettlement =
+        snapshot.state === null &&
+        Option.isSome(thread) &&
+        thread.value.settledOverride === "settled" &&
+        resolveAgentAwarenessRelayPublishSnapshot({
+          environmentId,
+          threadId,
+          thread: Option.some({ ...thread.value, settledOverride: null }),
+          project,
+        }).state?.phase === "completed";
+      if (hiddenOnlyBySettlement && held?.state != null) {
         yield* publishState({
           projectId: held.projectId,
           state: held.state,

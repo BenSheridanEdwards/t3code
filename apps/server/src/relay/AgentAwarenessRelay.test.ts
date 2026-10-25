@@ -478,6 +478,23 @@ describe("AgentAwarenessRelay", () => {
     }),
   );
 
+  it.effect("drops a held completion when a queued continuation hides the thread", () =>
+    Effect.gen(function* () {
+      const { relay, currentShell, publications } = yield* makeTestRelay();
+      yield* relay.publishThread(THREAD_ID);
+      yield* Ref.set(currentShell, shell({ status: "completed" }));
+      yield* relay.publishThread(THREAD_ID);
+      yield* Ref.set(currentShell, shell({ status: "queued" }));
+      yield* relay.publishThread(THREAD_ID);
+      yield* TestClock.adjust("5 seconds");
+      yield* relay.drain;
+      assert.notInclude(
+        publications.map((publication) => publication.state?.phase ?? null),
+        "completed",
+      );
+    }),
+  );
+
   it.effect("retries a failed completion even after the thread settles", () =>
     Effect.gen(function* () {
       const { relay, currentShell, publications } = yield* makeTestRelay({
