@@ -551,6 +551,8 @@ export const make = Effect.gen(function* () {
         operation,
         "GitCafe answered from a different revision of the pull request. Refresh the diff.",
       );
+    if (cursor !== null && page.next !== null && page.next === cursor.after)
+      return yield* failure(operation, "GitCafe returned a repeated diff page cursor.");
     const revision = { version, headOid: page.headOid, baseOid: page.comparisonBaseOid };
     return {
       items: page.items,

@@ -222,6 +222,34 @@ describe("GitCafePullRequestProvider changed paths", () => {
     },
   );
 
+  it.effect.each(["getDiff", "getDiffFilePaths"] as const)(
+    "%s rejects a repeated continuation cursor",
+    (operation) => {
+      const server = fakeGitCafe({
+        "GET /repos/owner/repo/pulls/7": pull,
+        "GET /repos/owner/repo/pulls/7/changes": {
+          ...snapshot,
+          items: [],
+          next: "same-page",
+        },
+      });
+      return Effect.gen(function* () {
+        const provider = yield* GitCafePullRequestProvider.make;
+        const first = yield* provider[operation]!(target);
+        const input = { ...target, cursor: first.nextCursor! };
+        const result =
+          operation === "getDiff"
+            ? yield* provider.getDiff(input).pipe(Effect.result)
+            : yield* provider.getDiffFilePaths!(input).pipe(Effect.result);
+        assert.strictEqual(result._tag, "Failure");
+        assert.strictEqual(
+          server.sent.filter((request) => request.path.endsWith("/changes")).length,
+          2,
+        );
+      }).pipe(Effect.provide(server.layer));
+    },
+  );
+
   it.effect.each([{ version: 5 }, { headOid: baseOid }, { comparisonBaseOid: headOid }])(
     "refuses metadata pages from different comparison snapshots (%j)",
     (changed) => {
