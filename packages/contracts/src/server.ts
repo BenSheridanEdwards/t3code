@@ -595,6 +595,12 @@ export const ServerConfig = Schema.Struct({
   settings: ServerSettings,
   shellResumeCompletionMarker: Schema.optionalKey(Schema.Boolean),
   /**
+   * Opaque, new for each server process. A shell synchronized against one value may resume from its
+   * cursor in a later session only while the server sends the same value: a new process can carry
+   * migrations, new code or another database, none of which emit events.
+   */
+  shellResumeKey: Schema.optionalKey(Schema.String),
+  /**
    * The shell can leave idle subagent children out of snapshots (`omitIdleSubagents`), and
    * `getThreadFamily` and `getWorktreeThreadIds` serve the rows it leaves out.
    */

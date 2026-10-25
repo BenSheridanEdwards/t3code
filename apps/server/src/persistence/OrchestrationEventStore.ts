@@ -39,6 +39,13 @@ export type UnsequencedProjectEvent = ApplicationProjectEvent extends infer Even
     : never
   : never;
 
+export interface ShellReplayHead {
+  readonly aggregateKind: "project" | "thread";
+  readonly aggregateId: string;
+  readonly sequence: number;
+  readonly eventType: string;
+}
+
 export class OrchestrationEventStore extends Context.Service<
   OrchestrationEventStore,
   {
@@ -76,16 +83,18 @@ export class OrchestrationEventStore extends Context.Service<
       OrchestrationEventStoreError
     >;
 
-    readonly getReplayStats: (input: {
+    /**
+     * The newest application event of each project and thread in the range, oldest first, without
+     * reading payloads: a shell resume sends each touched aggregate's current row. Events of
+     * `transcriptEventTypes` on `skipTranscriptOf` threads do not count.
+     */
+    readonly readShellReplayHeads: (input: {
       readonly afterSequence: number;
       readonly throughSequence: number;
-    }) => Effect.Effect<
-      {
-        readonly eventCount: number;
-        readonly rawPayloadBytes: number;
-      },
-      OrchestrationEventStoreError
-    >;
+      readonly transcriptEventTypes: ReadonlyArray<string>;
+      readonly skipTranscriptOf: ReadonlyArray<string>;
+      readonly limit: number;
+    }) => Effect.Effect<ReadonlyArray<ShellReplayHead>, OrchestrationEventStoreError>;
 
     readonly latestAgentSequence: (
       threadId?: ThreadId,
@@ -616,11 +625,16 @@ const makeEventStore = Effect.gen(function* () {
       })),
     );
 
-  const getReplayStats: OrchestrationEventStore["Service"]["getReplayStats"] = (input) =>
-    sql<{ readonly eventCount: number; readonly rawPayloadBytes: number }>`
+  // With a single MAX aggregate, SQLite takes the bare `event_type` from the row holding the MAX.
+  const readShellReplayHeads: OrchestrationEventStore["Service"]["readShellReplayHeads"] = (
+    input,
+  ) =>
+    sql<ShellReplayHead>`
       SELECT
-        COUNT(*) AS "eventCount",
-        COALESCE(SUM(octet_length(${restoredPayloadJson})), 0) AS "rawPayloadBytes"
+        aggregate_kind AS "aggregateKind",
+        stream_id AS "aggregateId",
+        MAX(sequence) AS "sequence",
+        event_type AS "eventType"
       FROM orchestration_events INDEXED BY idx_orchestration_events_application_high_water
       WHERE sequence > ${input.afterSequence}
         AND sequence <= ${input.throughSequence}
@@ -628,13 +642,16 @@ const makeEventStore = Effect.gen(function* () {
           aggregate_kind = 'project'
           OR (application_event_version = 2 AND aggregate_kind = 'thread')
         )
+        AND NOT (
+          event_type IN (SELECT value FROM json_each(${JSON.stringify(input.transcriptEventTypes)}))
+          AND stream_id IN (SELECT value FROM json_each(${JSON.stringify(input.skipTranscriptOf)}))
+        )
+      GROUP BY aggregate_kind, stream_id
+      ORDER BY MAX(sequence)
+      LIMIT ${input.limit}
     `.pipe(
       NodeSqliteClient.readOnly,
-      Effect.mapError(toPersistenceSqlError("OrchestrationEventStore.getReplayStats:query")),
-      Effect.map((rows) => ({
-        eventCount: rows[0]?.eventCount ?? 0,
-        rawPayloadBytes: rows[0]?.rawPayloadBytes ?? 0,
-      })),
+      Effect.mapError(toPersistenceSqlError("OrchestrationEventStore.readShellReplayHeads:query")),
     );
 
   const latestAgentSequence: OrchestrationEventStore["Service"]["latestAgentSequence"] = (
@@ -744,7 +761,7 @@ const makeEventStore = Effect.gen(function* () {
     appendAgentEvents,
     readAgentEvents,
     getAgentReplayStats,
-    getReplayStats,
+    readShellReplayHeads,
     latestAgentSequence,
     latestApplicationSequence,
     readApplicationEvents: catchUpApplicationEvents,

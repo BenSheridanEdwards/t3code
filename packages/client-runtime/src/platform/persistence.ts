@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 
 import type { ConnectionRegistration } from "../connection/catalog.ts";
 import type { DeferredShellSnapshot } from "../state/shellPullRequests.ts";
+import type { ShellResumeBasis } from "./orchestrationCache.ts";
 import type { ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
 
 export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPersistenceError>()(
@@ -77,15 +78,21 @@ export class ConnectionRegistrationStore extends Context.Service<
   }
 >()("@t3tools/client-runtime/platform/persistence/ConnectionRegistrationStore") {}
 
+export interface CachedEnvironmentShell {
+  readonly snapshot: DeferredShellSnapshot;
+  readonly resume?: ShellResumeBasis;
+}
+
 export class EnvironmentCacheStore extends Context.Service<
   EnvironmentCacheStore,
   {
     readonly loadShell: (
       environmentId: EnvironmentId,
-    ) => Effect.Effect<Option.Option<DeferredShellSnapshot>, ConnectionPersistenceError>;
+    ) => Effect.Effect<Option.Option<CachedEnvironmentShell>, ConnectionPersistenceError>;
     readonly saveShell: (
       environmentId: EnvironmentId,
       snapshot: OrchestrationV2ShellSnapshot,
+      resume?: ShellResumeBasis,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly loadThread: (
       environmentId: EnvironmentId,

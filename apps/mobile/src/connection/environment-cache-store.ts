@@ -111,7 +111,12 @@ export const make = Effect.fn("MobileEnvironmentCacheStore.make")(function* () {
         operation: "load-shell",
         decode: decodeStoredShellSnapshot,
         select: (stored) =>
-          stored.environmentId === environmentId ? Option.some(stored.snapshot) : Option.none(),
+          stored.environmentId === environmentId
+            ? Option.some({
+                snapshot: stored.snapshot,
+                ...(stored.resume === undefined ? {} : { resume: stored.resume }),
+              })
+            : Option.none(),
       }).pipe(
         Effect.zipWith(
           Effect.promise(() => projectFaviconDatabaseCache.hydrate()),
@@ -120,16 +125,25 @@ export const make = Effect.fn("MobileEnvironmentCacheStore.make")(function* () {
         ),
       ),
     ),
-    saveShell: Effect.fn("MobileEnvironmentCache.saveShell")(function* (environmentId, snapshot) {
-      const payload = yield* encodeStoredShellSnapshot({
-        schemaVersion: ORCHESTRATION_CACHE_SCHEMA_VERSION,
-        environmentId,
-        snapshot,
-      }).pipe(Effect.mapError((cause) => persistenceError("save-shell", cause)));
-      yield* database
-        .saveCache(environmentId, "shell", "snapshot", ORCHESTRATION_CACHE_SCHEMA_VERSION, payload)
-        .pipe(Effect.mapError(mapDatabaseError("save-shell")));
-    }),
+    saveShell: Effect.fn("MobileEnvironmentCache.saveShell")(
+      function* (environmentId, snapshot, resume) {
+        const payload = yield* encodeStoredShellSnapshot({
+          schemaVersion: ORCHESTRATION_CACHE_SCHEMA_VERSION,
+          environmentId,
+          snapshot,
+          ...(resume === undefined ? {} : { resume }),
+        }).pipe(Effect.mapError((cause) => persistenceError("save-shell", cause)));
+        yield* database
+          .saveCache(
+            environmentId,
+            "shell",
+            "snapshot",
+            ORCHESTRATION_CACHE_SCHEMA_VERSION,
+            payload,
+          )
+          .pipe(Effect.mapError(mapDatabaseError("save-shell")));
+      },
+    ),
     loadThread: Effect.fn("MobileEnvironmentCache.loadThread")((environmentId, threadId) =>
       loadDecodedCache({
         database,

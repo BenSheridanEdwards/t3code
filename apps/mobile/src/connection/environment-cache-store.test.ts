@@ -204,11 +204,14 @@ describe("mobile SQLite environment cache store", () => {
       const store = yield* make().pipe(
         Effect.provideService(MobileDatabase.MobileDatabase, memory.database),
       );
+      const resume = { key: "resume-key", syncedAt: 1_753_790_400_000 };
 
-      yield* store.saveShell(ENVIRONMENT_ID, SHELL_SNAPSHOT);
+      yield* store.saveShell(ENVIRONMENT_ID, SHELL_SNAPSHOT, resume);
       yield* store.saveThread(ENVIRONMENT_ID, THREAD_SNAPSHOT);
 
-      const shell = Option.getOrThrow(yield* store.loadShell(ENVIRONMENT_ID));
+      const cached = Option.getOrThrow(yield* store.loadShell(ENVIRONMENT_ID));
+      const shell = cached.snapshot;
+      expect(cached.resume).toEqual(resume);
       const thread = Option.getOrThrow(yield* store.loadThread(ENVIRONMENT_ID, THREAD_ID));
 
       expect(DateTime.formatIso(shell.threads[0]!.updatedAt)).toBe("2026-07-29T12:00:00.000Z");
@@ -257,7 +260,7 @@ describe("mobile SQLite environment cache store", () => {
         threads: [linked, unlinked],
       });
 
-      const shell = Option.getOrThrow(yield* store.loadShell(ENVIRONMENT_ID));
+      const shell = Option.getOrThrow(yield* store.loadShell(ENVIRONMENT_ID)).snapshot;
       expect(shell.threads.map((thread) => thread.pullRequests)).toEqual([undefined, undefined]);
       const links = yield* shell.loadPullRequests!;
       expect([...links]).toEqual([[THREAD_ID, [link]]]);
@@ -298,7 +301,7 @@ describe("mobile SQLite environment cache store", () => {
       payload.snapshot.threads[0].pullRequests = [{ number: -1 }];
       memory.values.set(id, JSON.stringify(payload));
 
-      const shell = Option.getOrThrow(yield* store.loadShell(ENVIRONMENT_ID));
+      const shell = Option.getOrThrow(yield* store.loadShell(ENVIRONMENT_ID)).snapshot;
       expect(shell.threads.map((thread) => thread.id)).toEqual([THREAD_ID, readable.id]);
       expect([...(yield* shell.loadPullRequests!)]).toEqual([[readable.id, [link]]]);
       expect(messages).toHaveLength(1);

@@ -12,11 +12,14 @@ import {
   isLiveSubagentShell,
   OrchestrationProjectShell as ProjectShellSchema,
   OrchestrationV2ThreadShell as ThreadShellSchema,
+  ProjectId,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import type * as Arr from "effect/Array";
 import type * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -25,6 +28,7 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
+import type { ShellReplayHead } from "../persistence/OrchestrationEventStore.ts";
 import { bufferLatestLiveStream } from "./LiveStreamBudget.ts";
 
 type ShellDelta = Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>;
@@ -150,7 +154,14 @@ export type ShellApplicationEvent =
       readonly event: Pick<OrchestrationV2StoredEvent["event"], "threadId">;
     };
 
-/** Focused subagents receive these updates through their thread subscription. */
+/** Subagent events the shell skips; focused subagents receive them through their thread subscription. */
+export const SUBAGENT_TRANSCRIPT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "node.updated",
+  "turn-item.updated",
+  "provider-turn.updated",
+  "message.updated",
+]);
+
 export function shouldPublishShellApplicationEvent(
   stored: ApplicationStoredEvent,
   subagentThreadIds: Set<string>,
@@ -168,13 +179,21 @@ export function shouldPublishShellApplicationEvent(
     return true;
   }
   return !(
-    subagentThreadIds.has(event.threadId) &&
-    (event.type === "node.updated" ||
-      event.type === "turn-item.updated" ||
-      event.type === "provider-turn.updated" ||
-      event.type === "message.updated")
+    subagentThreadIds.has(event.threadId) && SUBAGENT_TRANSCRIPT_EVENT_TYPES.has(event.type)
   );
 }
+
+/**
+ * `ServerConfig.shellResumeKey`. The default is computed once and cached on the reference, so it
+ * is one random value per server process; tests provide their own.
+ */
+export class ShellResumeKey extends Context.Reference<string>(
+  "@t3tools/server/orchestration-v2/ShellStream/ShellResumeKey",
+  {
+    // @effect-diagnostics-next-line cryptoRandomUUID:off - A reference default runs outside Effect.
+    defaultValue: () => crypto.randomUUID(),
+  },
+) {}
 
 /** Shell updates refetch an aggregate; drop transcript bodies before retaining an event. */
 export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellApplicationEvent {
@@ -186,6 +205,18 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
         sequence: stored.sequence,
       }
     : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
+}
+
+export function shellApplicationEventFromReplayHead(head: ShellReplayHead): ShellApplicationEvent {
+  return head.aggregateKind === "project"
+    ? {
+        aggregateKind: "project",
+        aggregateId: ProjectId.make(head.aggregateId),
+        // Only a deletion skips the row read; any other project event, even an unknown one, reads it.
+        type: head.eventType === "project.deleted" ? "project.deleted" : "project.meta-updated",
+        sequence: head.sequence,
+      }
+    : { sequence: head.sequence, event: { threadId: ThreadId.make(head.aggregateId) } };
 }
 
 export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(

@@ -133,12 +133,15 @@ import {
   dedupeShellEnrichment,
   activeShellRowsForSubscriber,
   loadShellSnapshotParts,
+  shellApplicationEventFromReplayHead,
+  ShellResumeKey,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
+  SUBAGENT_TRANSCRIPT_EVENT_TYPES,
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
@@ -570,11 +573,10 @@ const isOtherWsRpc = (rpc: ServerWsRpc): rpc is Exclude<ServerWsRpc, SplitWsRpc>
 const serverWsRpcs = Array.from(ServerWsRpcGroup.requests.values());
 const SplitWsRpcGroup = RpcGroup.make(...serverWsRpcs.filter(isSplitWsRpc));
 const OtherWsRpcGroup = RpcGroup.make(...serverWsRpcs.filter(isOtherWsRpc));
-// Replaying each intervening event costs a shell refetch; past this gap a
-// single O(active-threads) snapshot is cheaper and bounded.
-const SHELL_RESUME_MAX_GAP = 1_000;
-// Row counts do not bound large tool payloads; sum stored JSON bytes in SQL and snapshot above budget.
-const ORCHESTRATION_REPLAY_PAYLOAD_BUDGET_BYTES = 8 * 1024 * 1024;
+// A shell resume decodes no payloads: one indexed scan of the gap finds the touched projects and
+// threads, then their current rows are read. Past either cap a snapshot is about as cheap.
+const SHELL_RESUME_MAX_GAP = 100_000;
+const SHELL_RESUME_MAX_TOUCHED = 500;
 
 function toAuthAccessStreamEvent(
   change: PairingGrantStore.BootstrapCredentialChange | SessionStore.SessionCredentialChange,
@@ -722,35 +724,6 @@ function readClientOwners(
     ownerId !== null && isTelemetryIdHash(ownerId) ? [{ source, ownerId }] : [],
   );
 }
-
-const canReplayPersistedRange = Effect.fnUntraced(function* (
-  afterSequence: number,
-  headSequence: number,
-  maxGap: number,
-) {
-  const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
-
-  const replayGap = headSequence - afterSequence;
-  if (replayGap < 0 || replayGap > maxGap) {
-    return false;
-  }
-  const stats = yield* applicationEvents.getReplayStats({
-    afterSequence,
-    throughSequence: headSequence,
-  });
-  if (stats.rawPayloadBytes > ORCHESTRATION_REPLAY_PAYLOAD_BUDGET_BYTES) {
-    yield* Effect.logDebug("orchestration replay replaced by snapshot", {
-      afterSequence,
-      headSequence,
-      replayGap,
-      eventCount: stats.eventCount,
-      payloadBytes: stats.rawPayloadBytes,
-      payloadBudgetBytes: ORCHESTRATION_REPLAY_PAYLOAD_BUDGET_BYTES,
-    });
-    return false;
-  }
-  return true;
-});
 
 const enrichProjectShells = Effect.fn("ws.orchestrationV2.enrichProjectShells")(
   (projects: ReadonlyArray<OrchestrationProjectShell>) =>
@@ -1158,41 +1131,39 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const completionThenLive = (afterSequence: number) =>
       Stream.concat(completionMarker, liveFrom(afterSequence));
 
+    const snapshotThenLive = Effect.gen(function* () {
+      const loaded = yield* loadSnapshot();
+      return composeShellStreamWithEnrichment({
+        initial: initialSnapshotItems(loaded),
+        tail: completionThenLive(loaded.snapshot.snapshotSequence),
+        enrichment: enrichmentRefreshes,
+      });
+    });
+
     const stream = yield* Effect.gen(function* () {
-      if (input.afterSequence === undefined) {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
-        });
-      }
+      if (input.afterSequence === undefined) return yield* snapshotThenLive;
 
       const highWater = yield* applicationEvents.latestApplicationSequence;
-      if (!(yield* canReplayPersistedRange(input.afterSequence, highWater, SHELL_RESUME_MAX_GAP))) {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
-        });
-      }
+      const gap = highWater - input.afterSequence;
+      // A cursor past the head came from another event log.
+      if (gap < 0 || gap > SHELL_RESUME_MAX_GAP) return yield* snapshotThenLive;
 
       subagentThreadIds = new Set(yield* threadManagement.listActiveSubagentThreadIds());
+      // Each touched aggregate is sent once with its current row. Event types this build does not
+      // know count as touches, since nothing is decoded.
+      const heads = yield* applicationEvents.readShellReplayHeads({
+        afterSequence: input.afterSequence,
+        throughSequence: highWater,
+        transcriptEventTypes: [...SUBAGENT_TRANSCRIPT_EVENT_TYPES],
+        skipTranscriptOf: [...subagentThreadIds],
+        limit: SHELL_RESUME_MAX_TOUCHED + 1,
+      });
+      if (heads.length > SHELL_RESUME_MAX_TOUCHED) return yield* snapshotThenLive;
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
-      const replay = toShellStream(
-        applicationEvents
-          .readApplicationEvents({
-            afterSequence: input.afterSequence,
-            throughSequence: highWater,
-            // A row a newer build wrote (e.g. after a downgrade) must not fail
-            // every shell resubscribe. The live tail below resumes from
-            // highWater, so a dropped row never hides later events.
-            skipUnknownEventTypes: true,
-          })
-          .pipe(Stream.filter(filterSubagentTranscript)),
-      );
+      const replay = Stream.fromEffect(
+        projectShellItems(heads.map(shellApplicationEventFromReplayHead)),
+      ).pipe(Stream.flatMap(Stream.fromIterable));
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
         tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),
@@ -1729,6 +1700,7 @@ export const layerWsRpc = (
         const auth = yield* serverAuth.getDescriptor();
         const scratchWorkspaceRoot = yield* managedFolders.scratchRoot;
         const lastEventLoopStall = yield* eventLoopMonitor.latestNoticeableStall;
+        const shellResumeKey = yield* ShellResumeKey;
         const editorConfig = yield* resolveEditorConfig(
           yield* resolveAvailableEditorsForConfig(externalLauncher.resolveAvailableEditors()),
           resolveFileManagerRevealKindForConfig(externalLauncher.resolveFileManagerRevealKind()),
@@ -1777,6 +1749,7 @@ export const layerWsRpc = (
           },
           settings,
           shellResumeCompletionMarker: true,
+          shellResumeKey,
           shellThreadFamilies: true,
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,

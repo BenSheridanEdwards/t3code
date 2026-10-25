@@ -16,8 +16,10 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as Application from "expo-application";
 import Constants from "expo-constants";
 import * as Network from "expo-network";
+import * as Updates from "expo-updates";
 import { AppState } from "react-native";
 
 import { authClientMetadata } from "../lib/authClientMetadata";
@@ -213,6 +215,12 @@ const layerCapabilities = Layer.effectContext(
         ClientCapabilities.ClientPresentation,
         ClientCapabilities.ClientPresentation.of({
           metadata: authClientMetadata(Constants.expoConfig?.version),
+          // Store builds can share a version, and over-the-air updates keep the native build.
+          build: [
+            Constants.expoConfig?.version,
+            Application.nativeBuildVersion,
+            Updates.updateId ?? "embedded",
+          ].join(" "),
         }),
       ),
       Context.add(

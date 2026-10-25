@@ -24,6 +24,7 @@ import {
   omitIdleSubagentShells,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemsFromInitialSnapshot,
+  ShellResumeKey,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
 } from "./ShellStream.ts";
@@ -571,6 +572,19 @@ describe("skipUnchangedThreadShells", () => {
         updated(3, shell("a")),
       ]);
       expect(sent).toEqual([1, 2, 3]);
+    }),
+  );
+});
+
+describe("shell resume key", () => {
+  it.effect("stays one value for the whole server process", () =>
+    Effect.gen(function* () {
+      // Each socket reads it on its own fiber, which falls back to the cached default.
+      const read = Effect.gen(function* () {
+        return yield* ShellResumeKey;
+      });
+      const [first, second] = yield* Effect.all([read, read], { concurrency: "unbounded" });
+      expect(second).toBe(first);
     }),
   );
 });

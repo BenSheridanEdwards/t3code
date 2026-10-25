@@ -68,6 +68,17 @@ a thread view or a queued message mounts. A missing shell row therefore does not
 prove a thread is gone: code that deletes data or a worktree on absence must
 check the family or the server first.
 
+A new session resumes the cached [shell](../../packages/client-runtime/src/state/shell.ts)
+from its cursor instead of loading a snapshot only when the shell was synchronized
+against the same resume key less than a day ago. The key combines the server's
+`shellResumeKey`, which is new for each server process, the client build, and
+the snapshot flags the session sends. So a change to shell rows that emits no
+event, such as a migration, must come with a new server process, and a new
+snapshot flag must join the one flag object `makeSubscribeInput` sends to both
+HTTP and the socket. A row a flag leaves out must return to a fresh snapshot
+only through an event: a resumed shell never receives a row that time alone
+brings back.
+
 [Thread detail](../../packages/client-runtime/src/state/threads.ts) separates
 subscription lifetime from cache lifetime. Mounted consumers share one live
 stream, which stops when the last consumer unmounts; hidden mounted routes still

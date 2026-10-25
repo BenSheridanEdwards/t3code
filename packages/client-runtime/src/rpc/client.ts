@@ -248,11 +248,19 @@ interface SubscriptionOptions<TTag extends EnvironmentSubscriptionRpcTag> {
   readonly resubscribe?: Stream.Stream<unknown, never, never>;
 }
 
+/**
+ * One subscribe call on one session. A session change, a foreground resubscribe and a retry after
+ * an expected failure each start a new attempt.
+ */
+export interface SubscriptionAttempt {
+  readonly session: RpcSession;
+}
+
 function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
   tag: TTag,
-  makeInput: (session: RpcSession) => Effect.Effect<EnvironmentRpcInput<TTag>>,
+  makeInput: (attempt: SubscriptionAttempt) => Effect.Effect<EnvironmentRpcInput<TTag>>,
   mapStream: (
-    session: RpcSession,
+    attempt: SubscriptionAttempt,
     stream: Stream.Stream<EnvironmentRpcStreamValue<TTag>, EnvironmentRpcStreamFailure<TTag>>,
   ) => Stream.Stream<A, EnvironmentRpcStreamFailure<TTag>>,
   options?: SubscriptionOptions<TTag>,
@@ -295,13 +303,14 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                 Stream.suspend(() =>
                   Stream.unwrap(
                     Effect.gen(function* () {
-                      const input = yield* makeInput(session);
+                      const attempt: SubscriptionAttempt = { session };
+                      const input = yield* makeInput(attempt);
                       const completeObservation = yield* observer.observe({
                         environmentId: supervisor.target.environmentId,
                         method: tag,
                         input,
                       });
-                      const stream = mapStream(session, method(input)).pipe(
+                      const stream = mapStream(attempt, method(input)).pipe(
                         Stream.onFirst(() =>
                           Effect.sync(() => {
                             expectedFailureRetries = 0;
@@ -399,7 +408,12 @@ export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
   EnvironmentRpcStreamFailure<TTag>,
   EnvironmentSupervisor.EnvironmentSupervisor
 > {
-  return subscribeDynamicMapped(tag, makeInput, (_session, stream) => stream, options);
+  return subscribeDynamicMapped(
+    tag,
+    (attempt) => makeInput(attempt.session),
+    (_attempt, stream) => stream,
+    options,
+  );
 }
 
 /** Tags each value before `switchMap` can buffer it across a session change. */
@@ -414,8 +428,29 @@ export function subscribeDynamicWithSession<TTag extends EnvironmentSubscription
 > {
   return subscribeDynamicMapped(
     tag,
+    (attempt) => makeInput(attempt.session),
+    (attempt, stream) => stream.pipe(Stream.map((value) => [attempt.session, value] as const)),
+    options,
+  );
+}
+
+/**
+ * Tags each value with its attempt before `switchMap` can buffer it into a later attempt, which
+ * matters even on one session: a resubscribe may load a newer snapshot than buffered values.
+ */
+export function subscribeDynamicWithAttempt<TTag extends EnvironmentSubscriptionRpcTag>(
+  tag: TTag,
+  makeInput: (attempt: SubscriptionAttempt) => Effect.Effect<EnvironmentRpcInput<TTag>>,
+  options?: SubscriptionOptions<TTag>,
+): Stream.Stream<
+  readonly [attempt: SubscriptionAttempt, value: EnvironmentRpcStreamValue<TTag>],
+  EnvironmentRpcStreamFailure<TTag>,
+  EnvironmentSupervisor.EnvironmentSupervisor
+> {
+  return subscribeDynamicMapped(
+    tag,
     makeInput,
-    (session, stream) => stream.pipe(Stream.map((value) => [session, value] as const)),
+    (attempt, stream) => stream.pipe(Stream.map((value) => [attempt, value] as const)),
     options,
   );
 }

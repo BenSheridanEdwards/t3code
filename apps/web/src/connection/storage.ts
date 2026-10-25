@@ -736,7 +736,10 @@ export const layer = Layer.effectContext(
                 Effect.mapError((cause) => persistenceError("load-shell", cause)),
                 Effect.map((stored) =>
                   stored.environmentId === environmentId
-                    ? Option.some(stored.snapshot)
+                    ? Option.some({
+                        snapshot: stored.snapshot,
+                        ...(stored.resume === undefined ? {} : { resume: stored.resume }),
+                      })
                     : Option.none(),
                 ),
               ),
@@ -746,11 +749,12 @@ export const layer = Layer.effectContext(
           Effect.mapError((cause) => persistenceError("load-shell", cause)),
         ),
       saveShell: Effect.fn("storage.saveShell")(
-        function* (environmentId, snapshot) {
+        function* (environmentId, snapshot, resume) {
           const encoded = yield* encodeStoredShellSnapshot({
             schemaVersion: ORCHESTRATION_CACHE_SCHEMA_VERSION,
             environmentId,
             snapshot,
+            ...(resume === undefined ? {} : { resume }),
           }).pipe(Effect.mapError((cause) => persistenceError("save-shell", cause)));
           yield* writeDatabaseValue(database, SHELL_STORE_NAME, environmentId, encoded);
         },

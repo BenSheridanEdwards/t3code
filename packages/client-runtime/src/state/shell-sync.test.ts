@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2GetShellSnapshotError,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
   ThreadId,
@@ -17,6 +18,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -24,6 +26,7 @@ import {
   type PreparedConnection,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
@@ -52,16 +55,125 @@ const LIVE_SHELL_SNAPSHOT: OrchestrationV2ShellSnapshot = {
   snapshotSequence: 1,
 };
 
-function session(client: WsRpcProtocolClient): RpcSession.RpcSession {
+function session(
+  client: WsRpcProtocolClient,
+  config: object = { shellResumeCompletionMarker: true },
+): RpcSession.RpcSession {
   return {
     client,
-    initialConfig: Effect.succeed({ shellResumeCompletionMarker: true } as never),
+    initialConfig: Effect.succeed(config as never),
     subscribeServerConfig: (input) => client.subscribeServerConfig(input),
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
   };
 }
+
+const RESUMABLE_CONFIG = {
+  shellResumeCompletionMarker: true,
+  shellThreadFamilies: true,
+  shellResumeKey: "server-1",
+};
+
+/**
+ * A shell state on one session whose socket replays `events`. The HTTP loader answers at
+ * `httpSequence`, and saves are recorded.
+ */
+const makeResumeHarness = Effect.fn(function* (input: {
+  readonly cache?: Persistence.CachedEnvironmentShell;
+  readonly config?: object;
+  readonly build?: string;
+  readonly httpSequence: number;
+}) {
+  const events = yield* Queue.unbounded<
+    OrchestrationV2ShellStreamItem | OrchestrationV2GetShellSnapshotError
+  >();
+  const subscriptions = yield* Queue.unbounded<unknown>();
+  const saved = yield* Ref.make<ReadonlyArray<Persistence.CachedEnvironmentShell>>([]);
+  const loads = yield* Ref.make(0);
+  const client = {
+    [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (subscribeInput: unknown) =>
+      Stream.unwrap(
+        Queue.offer(subscriptions, subscribeInput).pipe(
+          Effect.as(
+            Stream.fromQueue(events).pipe(
+              Stream.mapEffect((item) =>
+                "_tag" in item ? Effect.fail(item) : Effect.succeed(item),
+              ),
+            ),
+          ),
+        ),
+      ),
+  } as unknown as WsRpcProtocolClient;
+  const activeSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+    Option.some(session(client, input.config ?? RESUMABLE_CONFIG)),
+  );
+  const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+    target: TARGET,
+    state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+    session: activeSession,
+    prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+    connect: Effect.void,
+    disconnect: Effect.void,
+    retryNow: Effect.void,
+  } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+  const cache = Persistence.EnvironmentCacheStore.of({
+    loadShell: () => Effect.succeed(Option.fromUndefinedOr(input.cache)),
+    saveShell: (_environmentId, snapshot, resume) =>
+      Ref.update(saved, (all) => [
+        ...all,
+        { snapshot, ...(resume === undefined ? {} : { resume }) },
+      ]),
+    loadThread: () => Effect.succeedNone,
+    saveThread: () => Effect.void,
+    removeThread: () => Effect.void,
+    loadServerConfig: () => Effect.succeedNone,
+    saveServerConfig: () => Effect.void,
+    loadVcsRefs: () => Effect.succeedNone,
+    saveVcsRefs: () => Effect.void,
+    removeVcsRefs: () => Effect.void,
+    clearVcsRefs: () => Effect.void,
+    clear: () => Effect.void,
+  });
+  const snapshotLoader = ShellSnapshotLoader.ShellSnapshotLoader.of({
+    load: () =>
+      Ref.update(loads, (count) => count + 1).pipe(
+        Effect.as(Option.some({ ...LIVE_SHELL_SNAPSHOT, snapshotSequence: input.httpSequence })),
+      ),
+  });
+  const presentation = ClientCapabilities.ClientPresentation.of({
+    metadata: { label: "Test" } as never,
+    ...(input.build === undefined ? {} : { build: input.build }),
+  });
+  const shellState = yield* makeEnvironmentShellState().pipe(
+    Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+    Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+    Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, snapshotLoader),
+    Effect.provideService(ClientCapabilities.ClientPresentation, presentation),
+  );
+  const stateWhere = (predicate: (state: EnvironmentShellState) => boolean) =>
+    SubscriptionRef.changes(shellState).pipe(
+      Stream.filter(predicate),
+      Stream.runHead,
+      Effect.map(Option.getOrThrow),
+    );
+  return { activeSession, client, events, loads, saved, shellState, stateWhere, subscriptions };
+});
+
+/** Runs a client once against a resumable server and returns the shell it saved on close. */
+const savedResumableShell = Effect.fn(function* () {
+  const scope = yield* Scope.make();
+  const before = yield* makeResumeHarness({ build: "build-1", httpSequence: 10 }).pipe(
+    Scope.provide(scope),
+  );
+  yield* Queue.take(before.subscriptions);
+  yield* Queue.offer(before.events, { kind: "synchronized" });
+  yield* before.stateWhere((state) => state.status === "live");
+  yield* Scope.close(scope, Exit.void);
+  return (yield* Ref.get(before.saved)).at(-1)!;
+});
+
+const RESUMED_INPUT = { afterSequence: 10, omitIdleSubagents: true, requestCompletionMarker: true };
 
 describe("environment shell synchronization", () => {
   it.effect("flushes the latest live snapshot without blocking connection state updates", () =>
@@ -443,7 +555,7 @@ describe("environment shell synchronization", () => {
         retryNow: Effect.void,
       } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
       const cache = Persistence.EnvironmentCacheStore.of({
-        loadShell: () => Effect.succeed(Option.some(cachedSnapshot)),
+        loadShell: () => Effect.succeedSome({ snapshot: cachedSnapshot }),
         saveShell: () => Effect.void,
         loadThread: () => Effect.succeed(Option.none()),
         saveThread: () => Effect.void,
@@ -605,15 +717,17 @@ describe("environment shell synchronization", () => {
       const cache = Persistence.EnvironmentCacheStore.of({
         loadShell: () =>
           Effect.succeedSome({
-            ...cachedSnapshot,
-            loadPullRequests: Deferred.await(linksReady).pipe(
-              Effect.as(
-                new Map([
-                  [v2ThreadShell.id, [link(1)]],
-                  [otherThreadId, [link(2)]],
-                ]),
+            snapshot: {
+              ...cachedSnapshot,
+              loadPullRequests: Deferred.await(linksReady).pipe(
+                Effect.as(
+                  new Map([
+                    [v2ThreadShell.id, [link(1)]],
+                    [otherThreadId, [link(2)]],
+                  ]),
+                ),
               ),
-            ),
+            },
           }),
         saveShell: () => Effect.void,
         loadThread: () => Effect.succeedNone,
@@ -753,6 +867,149 @@ describe("environment shell synchronization", () => {
         Effect.map(Option.getOrThrow),
       );
       expect(filled).toEqual([link(2)]);
+    }),
+  );
+  it.effect("a restarted client resumes its saved shell without HTTP and saves nothing new", () =>
+    Effect.gen(function* () {
+      const cached = yield* savedResumableShell();
+      expect(cached.resume?.key).toEqual(expect.any(String));
+
+      const scope = yield* Scope.make();
+      const after = yield* makeResumeHarness({
+        cache: cached,
+        build: "build-1",
+        httpSequence: 20,
+      }).pipe(Scope.provide(scope));
+      expect(yield* Queue.take(after.subscriptions)).toEqual(RESUMED_INPUT);
+      expect(yield* Ref.get(after.loads)).toBe(0);
+      // Thread families wait while the resumed replay runs.
+      expect((yield* SubscriptionRef.get(after.shellState)).generation).toBe(0);
+      yield* Queue.offer(after.events, { kind: "synchronized" });
+      const live = yield* after.stateWhere((state) => state.status === "live");
+      expect(live.generation).toBeGreaterThan(0);
+      yield* Scope.close(scope, Exit.void);
+      expect(yield* Ref.get(after.saved)).toEqual([]);
+    }),
+  );
+
+  it.effect.each([
+    { name: "another server process", config: { ...RESUMABLE_CONFIG, shellResumeKey: "server-2" } },
+    { name: "another client build", build: "build-2" },
+    { name: "other snapshot flags", config: { ...RESUMABLE_CONFIG, shellThreadFamilies: false } },
+    {
+      name: "a server without completion markers",
+      config: { ...RESUMABLE_CONFIG, shellResumeCompletionMarker: false },
+    },
+    { name: "an older client's cache", dropResume: true },
+    { name: "a basis 24 hours old", elapsed: "24 hours" as const },
+    { name: "a basis from the future", future: true },
+  ])("loads HTTP instead of resuming $name", (scenario) =>
+    Effect.gen(function* () {
+      const saved = yield* savedResumableShell();
+      const cached: Persistence.CachedEnvironmentShell =
+        scenario.dropResume === true
+          ? { snapshot: saved.snapshot }
+          : scenario.future === true
+            ? { ...saved, resume: { ...saved.resume!, syncedAt: saved.resume!.syncedAt + 60_000 } }
+            : saved;
+      if (scenario.elapsed !== undefined) yield* TestClock.adjust(scenario.elapsed);
+      const after = yield* makeResumeHarness({
+        cache: cached,
+        build: scenario.build ?? "build-1",
+        httpSequence: 20,
+        ...(scenario.config === undefined ? {} : { config: scenario.config }),
+      });
+      expect(yield* Queue.take(after.subscriptions)).toMatchObject({ afterSequence: 20 });
+      expect(yield* Ref.get(after.loads)).toBe(1);
+    }),
+  );
+
+  it.effect("a resumed shell counts as authoritative only once its replay completes", () =>
+    Effect.gen(function* () {
+      const cached = yield* savedResumableShell();
+      const after = yield* makeResumeHarness({ cache: cached, build: "build-1", httpSequence: 20 });
+      expect(yield* Queue.take(after.subscriptions)).toEqual(RESUMED_INPUT);
+      yield* Queue.offer(after.events, {
+        kind: "thread.removed",
+        sequence: 11,
+        location: "active",
+        threadId: v2ThreadShell.id,
+      });
+      const replayed = yield* after.stateWhere((state) =>
+        Option.exists(state.snapshot, (snapshot) => snapshot.threads.length === 0),
+      );
+      expect(replayed.generation).toBe(0);
+      yield* Queue.offer(after.events, { kind: "synchronized" });
+      const live = yield* after.stateWhere((state) => state.status === "live");
+      expect(live.generation).toBeGreaterThan(0);
+      // No family read settles at generation 0, so the new generation starts with no removals.
+      expect(live.removedAt.size).toBe(0);
+    }),
+  );
+
+  it.effect("errors after a completed resume retry from the cursor without HTTP", () =>
+    Effect.gen(function* () {
+      const cached = yield* savedResumableShell();
+      const after = yield* makeResumeHarness({ cache: cached, build: "build-1", httpSequence: 20 });
+      const failure = new OrchestrationV2GetShellSnapshotError({ message: "stream failed" });
+      expect(yield* Queue.take(after.subscriptions)).toEqual(RESUMED_INPUT);
+      yield* Queue.offer(after.events, { kind: "synchronized" });
+      yield* after.stateWhere((state) => state.status === "live");
+      // After the marker the session holds a complete shell, so neither error drops it.
+      for (const retryAfter of ["250 millis", "500 millis"] as const) {
+        yield* Queue.offer(after.events, failure);
+        yield* after.stateWhere((state) => Option.isSome(state.error));
+        yield* TestClock.adjust(retryAfter);
+        expect(yield* Queue.take(after.subscriptions)).toEqual(RESUMED_INPUT);
+      }
+      // The second error came before that attempt's marker; the next session still resumes.
+      yield* SubscriptionRef.set(
+        after.activeSession,
+        Option.some(session(after.client, RESUMABLE_CONFIG)),
+      );
+      expect(yield* Queue.take(after.subscriptions)).toEqual(RESUMED_INPUT);
+      expect(yield* Ref.get(after.loads)).toBe(0);
+    }),
+  );
+
+  it.effect("a resume that fails before its marker loads HTTP on the retry", () =>
+    Effect.gen(function* () {
+      const cached = yield* savedResumableShell();
+      const after = yield* makeResumeHarness({ cache: cached, build: "build-1", httpSequence: 20 });
+      expect(yield* Queue.take(after.subscriptions)).toEqual(RESUMED_INPUT);
+      // The metadata refresh that opens every resume is not an authoritative snapshot.
+      yield* Queue.offer(after.events, {
+        kind: "snapshot",
+        snapshot: { ...cached.snapshot, threads: [] },
+        resolvedRepositoryIdentityRoots: [],
+      });
+      yield* Queue.offer(
+        after.events,
+        new OrchestrationV2GetShellSnapshotError({ message: "replay failed" }),
+      );
+      yield* after.stateWhere((state) => Option.isSome(state.error));
+      yield* TestClock.adjust("250 millis");
+      expect(yield* Queue.take(after.subscriptions)).toMatchObject({ afterSequence: 20 });
+      expect(yield* Ref.get(after.loads)).toBe(1);
+    }),
+  );
+
+  it.effect("a new session on the same server resumes the in-memory shell and keeps families", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeResumeHarness({ build: "build-1", httpSequence: 10 });
+      expect(yield* Queue.take(harness.subscriptions)).toEqual(RESUMED_INPUT);
+      yield* Queue.offer(harness.events, { kind: "synchronized" });
+      const { generation } = yield* harness.stateWhere((state) => state.status === "live");
+
+      yield* SubscriptionRef.set(
+        harness.activeSession,
+        Option.some(session(harness.client, RESUMABLE_CONFIG)),
+      );
+      expect(yield* Queue.take(harness.subscriptions)).toEqual(RESUMED_INPUT);
+      expect(yield* Ref.get(harness.loads)).toBe(1);
+      yield* Queue.offer(harness.events, { kind: "synchronized" });
+      const resumed = yield* harness.stateWhere((state) => state.status === "live");
+      expect(resumed.generation).toBe(generation);
     }),
   );
 });

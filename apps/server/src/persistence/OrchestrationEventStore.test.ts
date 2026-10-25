@@ -209,11 +209,6 @@ layer("OrchestrationEventStore", (it) => {
         maxEvents: events.length,
       });
       assert.isAbove(stats.rawPayloadBytes, prompt.length * 6);
-      const applicationStats = yield* store.getReplayStats({
-        afterSequence,
-        throughSequence: yield* store.latestApplicationSequence,
-      });
-      assert.isAbove(applicationStats.rawPayloadBytes, prompt.length * 6);
     }),
   );
 
@@ -456,14 +451,77 @@ layer("OrchestrationEventStore", (it) => {
         rawPayloadBytes: 0,
         hasCreateEvent: false,
       });
-      assert.deepEqual(
-        yield* store.getReplayStats({ afterSequence: baseline, throughSequence: head }),
+    }),
+  );
+
+  it.effect("finds the newest shell event of each project and thread in a range", () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const baseline = yield* store.latestApplicationSequence;
+      const versions = new Map<string, number>();
+      const insert = Effect.fn(function* (
+        aggregateKind: "project" | "thread",
+        streamId: string,
+        eventType: string,
+        applicationEventVersion = 2,
+      ) {
+        const streamVersion = versions.get(streamId) ?? 0;
+        versions.set(streamId, streamVersion + 1);
+        const rows = yield* sql<{ readonly sequence: number }>`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+          ) VALUES (
+            ${`heads:${streamId}:${streamVersion}`}, ${aggregateKind}, ${streamId}, ${streamVersion},
+            ${eventType}, '2026-09-04T00:00:00.000Z', 'server', 'not JSON', '{}',
+            ${applicationEventVersion}
+          ) RETURNING sequence
+        `;
+        return rows[0]!.sequence;
+      });
+      yield* insert("thread", "heads:parent", "thread.created");
+      const projectHead = yield* insert("project", "heads:project", "project.deleted");
+      const childHead = yield* insert("thread", "heads:child", "thread.metadata-updated");
+      yield* insert("thread", "heads:child", "turn-item.updated");
+      // Legacy rows are not application events.
+      yield* insert("thread", "heads:legacy", "thread.metadata-updated", 1);
+      const parentHead = yield* insert("thread", "heads:parent", "future.event");
+      const head = yield* store.latestApplicationSequence;
+      const read = (input: { readonly afterSequence?: number; readonly limit?: number } = {}) =>
+        store.readShellReplayHeads({
+          afterSequence: input.afterSequence ?? baseline,
+          throughSequence: head,
+          transcriptEventTypes: ["turn-item.updated"],
+          skipTranscriptOf: ["heads:child"],
+          limit: input.limit ?? 10,
+        });
+
+      assert.deepEqual(yield* read(), [
         {
-          eventCount: 3,
-          rawPayloadBytes:
-            Buffer.byteLength(unicodePayload) + 2 * Buffer.byteLength(oversizedPayload),
+          aggregateKind: "project",
+          aggregateId: "heads:project",
+          sequence: projectHead,
+          eventType: "project.deleted",
         },
+        {
+          aggregateKind: "thread",
+          aggregateId: "heads:child",
+          sequence: childHead,
+          eventType: "thread.metadata-updated",
+        },
+        {
+          aggregateKind: "thread",
+          aggregateId: "heads:parent",
+          sequence: parentHead,
+          eventType: "future.event",
+        },
+      ]);
+      assert.deepEqual(
+        (yield* read({ limit: 2 })).map((row) => row.aggregateId),
+        ["heads:project", "heads:child"],
       );
+      assert.deepEqual(yield* read({ afterSequence: parentHead }), []);
     }),
   );
 

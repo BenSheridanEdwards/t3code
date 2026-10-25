@@ -275,7 +275,11 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   const cacheStore = Persistence.EnvironmentCacheStore.of({
     loadShell: (environmentId) =>
       Ref.get(shellCache).pipe(
-        Effect.map((cache) => Option.fromUndefinedOr(cache.get(environmentId))),
+        Effect.map((cache) =>
+          Option.map(Option.fromUndefinedOr(cache.get(environmentId)), (snapshot) => ({
+            snapshot,
+          })),
+        ),
       ),
     saveShell: (environmentId, snapshot) =>
       Ref.update(shellCache, (current) => {

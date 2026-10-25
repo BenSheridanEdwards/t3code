@@ -13,10 +13,21 @@ export const ORCHESTRATION_CACHE_SCHEMA_VERSION = 3 as const;
 // Older caches may contain human turns that bypassed server history budgets.
 export const ORCHESTRATION_THREAD_CACHE_SCHEMA_VERSION = 5 as const;
 
+/**
+ * What a cached shell was synchronized against: the session's resume key and the client time of
+ * its latest authoritative snapshot. Caches from older clients have none and are not resumed.
+ */
+export const ShellResumeBasis = Schema.Struct({
+  key: Schema.String,
+  syncedAt: Schema.Number,
+});
+export type ShellResumeBasis = typeof ShellResumeBasis.Type;
+
 export const StoredOrchestrationShellSnapshot = Schema.Struct({
   schemaVersion: Schema.Literal(ORCHESTRATION_CACHE_SCHEMA_VERSION),
   environmentId: EnvironmentId,
   snapshot: OrchestrationV2ShellSnapshotJson,
+  resume: Schema.optionalKey(ShellResumeBasis),
 });
 
 export const StoredOrchestrationThreadSnapshot = Schema.Struct({

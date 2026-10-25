@@ -26,7 +26,13 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { runStream, subscribe, subscribeDynamicWithSession } from "./client.ts";
+import {
+  runStream,
+  subscribe,
+  subscribeDynamicWithAttempt,
+  subscribeDynamicWithSession,
+  type SubscriptionAttempt,
+} from "./client.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -215,6 +221,69 @@ describe("environment RPC", () => {
         [firstSession, firstValue],
         [firstSession, bufferedFirstValue],
         [secondSession, secondValue],
+      ]);
+    }),
+  );
+
+  it.effect("keeps the producer attempt on an old value buffered across a resubscribe", () =>
+    Effect.gen(function* () {
+      const subscribed = yield* Queue.unbounded<number>();
+      const resubscribe = yield* Queue.unbounded<void>();
+      const firstValueBlocked = yield* Deferred.make<void>();
+      const releaseFirstValue = yield* Deferred.make<void>();
+      const firstValue = { attempt: 0, index: 1 } as unknown as ServerLifecycleStreamEvent;
+      const bufferedFirstValue = { attempt: 0, index: 2 } as unknown as ServerLifecycleStreamEvent;
+      const secondValue = { attempt: 1, index: 1 } as unknown as ServerLifecycleStreamEvent;
+      let calls = 0;
+      const client = {
+        [WS_METHODS.subscribeServerLifecycle]: () => {
+          const call = calls++;
+          return Stream.fromEffect(Queue.offer(subscribed, call)).pipe(
+            Stream.drain,
+            Stream.concat(
+              Stream.fromIterable(call === 0 ? [firstValue, bufferedFirstValue] : [secondValue]),
+            ),
+            Stream.concat(Stream.never),
+          );
+        },
+      } as unknown as WsRpcProtocolClient;
+      const { activeSession, supervisor } = yield* makeHarness();
+      const attempts: Array<SubscriptionAttempt> = [];
+
+      const resultFiber = yield* subscribeDynamicWithAttempt(
+        WS_METHODS.subscribeServerLifecycle,
+        (attempt) => Effect.sync(() => attempts.push(attempt)).pipe(Effect.as({})),
+        { resubscribe: Stream.fromQueue(resubscribe) },
+      ).pipe(
+        Stream.mapEffect(([attempt, value]) =>
+          value === firstValue
+            ? Deferred.succeed(firstValueBlocked, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseFirstValue)),
+                Effect.as([attempt, value] as const),
+              )
+            : Effect.succeed([attempt, value] as const),
+        ),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.forkChild,
+      );
+
+      yield* SubscriptionRef.set(activeSession, Option.some(session(client)));
+      expect(yield* Queue.take(subscribed)).toBe(0);
+      yield* Deferred.await(firstValueBlocked);
+      yield* Queue.offer(resubscribe, undefined);
+      expect(yield* Queue.take(subscribed)).toBe(1);
+      yield* Deferred.succeed(releaseFirstValue, undefined);
+
+      const result = yield* Fiber.join(resultFiber);
+      const [first, second] = attempts;
+      // One session, two attempts: only the attempt tells the buffered value apart.
+      expect(second?.session).toBe(first?.session);
+      expect(result).toEqual([
+        [first, firstValue],
+        [first, bufferedFirstValue],
+        [second, secondValue],
       ]);
     }),
   );

@@ -179,7 +179,7 @@ const ReplayTestLayer = OrchestrationEventStore.layer.pipe(
 );
 
 it.live.each(["thread", "shell"] as const)(
-  "%s resume skips unknown types, synchronizes, and receives the live tail",
+  "%s resume survives unknown types, synchronizes, and receives the live tail",
   (scope) =>
     Effect.gen(function* () {
       const store = yield* OrchestrationEventStore.OrchestrationEventStore;
@@ -287,9 +287,107 @@ it.live.each(["thread", "shell"] as const)(
       );
       assert.deepEqual(
         items.flatMap((item) => (item.sequence === undefined ? [] : [item.sequence])),
-        [after!.sequence, liveSequence],
+        // The shell decodes no payloads, so an unknown event still counts as a touch.
+        [scope === "thread" ? after!.sequence : highWater!.sequence, liveSequence],
       );
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("shell resume sends each touched aggregate once, or a snapshot past its limits", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const enrichment = yield* PubSub.unbounded();
+    const versions = new Map<string, number>();
+    const insert = Effect.fn(function* (
+      aggregateKind: "project" | "thread",
+      streamId: string,
+      eventType: string,
+    ) {
+      const streamVersion = versions.get(streamId) ?? 0;
+      versions.set(streamId, streamVersion + 1);
+      const [row] = yield* sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          ${`resume:${streamId}:${streamVersion}`}, ${aggregateKind}, ${streamId}, ${streamVersion},
+          ${eventType}, '2026-01-05T00:00:00.000Z', 'server', '{}', '{}', 2
+        ) RETURNING sequence
+      `;
+      return row!.sequence;
+    });
+    const resume = (afterSequence: number) =>
+      subscribeOrchestrationV2Shell({ afterSequence, requestCompletionMarker: true }).pipe(
+        Effect.flatMap((stream) =>
+          stream.pipe(
+            Stream.takeUntil((item) => item.kind === "synchronized"),
+            Stream.runCollect,
+          ),
+        ),
+        Effect.map((items) =>
+          Array.from(items, (item) =>
+            item.kind === "thread.updated"
+              ? `${item.thread.id}@${item.sequence}`
+              : item.kind === "thread.removed"
+                ? `-${item.threadId}@${item.sequence}`
+                : item.kind === "project.updated"
+                  ? `${item.project.id}@${item.sequence}`
+                  : item.kind,
+          ),
+        ),
+        Effect.provideService(ThreadManagement.ThreadManagementService, {
+          listActiveSubagentThreadIds: () => Effect.succeed([ThreadId.make("thread:subagent")]),
+          getThreadShell: (threadId: ThreadId) =>
+            Effect.succeed(
+              threadId === "thread:gone"
+                ? null
+                : ({ id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell),
+            ),
+          readShellSnapshot: () =>
+            Effect.succeed(
+              Effect.succeed({
+                schemaVersion: 1,
+                snapshotSequence: 0,
+                threads: [],
+                archivedThreads: [],
+              }),
+            ),
+        } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+        Effect.provideService(ProjectStore.ProjectStoreV2, {
+          listShells: () => Effect.succeed([]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        Effect.provideService(ProjectService.ProjectService, {
+          getShell: (projectId: ProjectId) =>
+            Effect.succeedSome({ id: projectId } as unknown as OrchestrationProjectShell),
+        } as unknown as ProjectService.ProjectService["Service"]),
+        Effect.provideService(ProjectEnrichment.ProjectEnrichmentService, {
+          subscribeChanges: PubSub.subscribe(enrichment),
+        } as ProjectEnrichment.ProjectEnrichmentService["Service"]),
+      );
+
+    const baseline = yield* insert("thread", "thread:kept", "thread.created");
+    const kept = yield* insert("thread", "thread:kept", "thread.metadata-updated");
+    const subagentRun = yield* insert("thread", "thread:subagent", "run.updated");
+    yield* insert("thread", "thread:subagent", "turn-item.updated");
+    const gone = yield* insert("thread", "thread:gone", "thread.deleted");
+    assert.deepEqual(yield* resume(baseline), [
+      `thread:kept@${kept}`,
+      `thread:subagent@${subagentRun}`,
+      `-thread:gone@${gone}`,
+      "synchronized",
+    ]);
+    // A cursor past the head came from another event log.
+    assert.deepEqual(yield* resume(gone + 1), ["snapshot", "synchronized"]);
+
+    const first = yield* insert("project", "project:0", "project.meta-updated");
+    for (let index = 1; index <= 500; index += 1) {
+      yield* insert("project", `project:${index}`, "project.meta-updated");
+    }
+    assert.deepEqual(yield* resume(gone), ["snapshot", "synchronized"]);
+    const capped = yield* resume(first);
+    assert.equal(capped.length, 501);
+    assert.equal(capped.at(-1), "synchronized");
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
 it.effect("shell snapshots leave idle subagent children out only for clients that ask", () =>

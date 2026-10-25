@@ -55,6 +55,11 @@ export class ClientPresentation extends Context.Service<
   ClientPresentation,
   {
     readonly metadata: AuthClientPresentationMetadata;
+    /**
+     * Changes whenever the client code changes, including over-the-air updates. A cached shell from
+     * another build is not resumed: a build drops the row fields it does not know when it decodes.
+     */
+    readonly build?: string;
   }
 >()("@t3tools/client-runtime/platform/capabilities/ClientPresentation") {}
 
