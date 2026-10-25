@@ -13,6 +13,14 @@ type ThreadScreenContent =
   | { readonly props: ThreadDetailScreenProps }
   | { readonly fallback: ReactNode };
 
+function sameProps(previous: object, next: object) {
+  const entries = Object.entries(next);
+  return (
+    entries.length === Object.keys(previous).length &&
+    entries.every(([key, value]) => Object.is((previous as Record<string, unknown>)[key], value))
+  );
+}
+
 function createThreadScreenStore() {
   let current: ThreadScreenContent | null = null;
   const listeners = new Set<() => void>();
@@ -25,6 +33,16 @@ function createThreadScreenStore() {
       };
     },
     publish: (content: ThreadScreenContent) => {
+      // Controllers re-render on every route and loading-status change; the thread screen is the
+      // expensive part, so it only re-renders when what it receives changed.
+      if (
+        current !== null &&
+        "props" in current &&
+        "props" in content &&
+        sameProps(current.props, content.props)
+      ) {
+        return;
+      }
       current = content;
       for (const listener of listeners) listener();
     },
