@@ -15,7 +15,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { presentThreadShell, resolveThreadWorkingStartedAt } from "./models.ts";
 import { v2Projection, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import { deriveLatestThreadRun, deriveThreadRuntime } from "./threadExecution.ts";
-import { isThreadWorking } from "./threadInbox.ts";
+import { decisionInboxThreads, isThreadWorking } from "./threadInbox.ts";
 import { derivePendingThreadRequests } from "./threadRequests.ts";
 import { canSnooze, effectiveSnoozed } from "./threadSettled.ts";
 
@@ -40,6 +40,12 @@ describe("V2 client presentation", () => {
     };
     const active = presentThreadShell(environmentId, running);
     expect(active.hasPendingUserInput).toBe(false);
+    expect(decisionInboxThreads([active])).toEqual([active]);
+    expect(
+      decisionInboxThreads([
+        presentThreadShell(environmentId, { ...running, pendingRuntimeRequest: null }),
+      ]),
+    ).toEqual([]);
     expect(isThreadWorking(active)).toBe(true);
     expect(canSnooze(active, { now: "2026-06-20T00:05:00.000Z" })).toBe(false);
 
@@ -581,5 +587,55 @@ describe("V2 client presentation", () => {
       { requestId: multiRequestId, multiSelect: true },
       { requestId: legacyRequestId, multiSelect: false },
     ]);
+  });
+});
+
+describe("decision inbox", () => {
+  const question = presentThreadShell(environmentId, {
+    ...v2ThreadShell,
+    pendingRuntimeRequest: {
+      id: RuntimeRequestId.make("decision-question"),
+      kind: "user_input",
+      createdAt: v2ThreadShell.updatedAt,
+    },
+  });
+
+  it("excludes completed work and removed threads but includes pinned and settled decisions", () => {
+    const pinned = { ...question, pinnedAt: question.createdAt };
+    const settled = { ...question, settledOverride: "settled" as const };
+    expect(
+      decisionInboxThreads([
+        presentThreadShell(environmentId, { ...v2ThreadShell, pendingRuntimeRequest: null }),
+        { ...question, archivedAt: question.createdAt },
+        { ...question, deletedAt: question.createdAt },
+      ]),
+    ).toEqual([]);
+    expect(decisionInboxThreads([pinned])).toEqual([pinned]);
+    expect(decisionInboxThreads([settled])).toEqual([settled]);
+  });
+
+  it("retains identical thread IDs in different environments", () => {
+    const remote = { ...question, environmentId: EnvironmentId.make("remote") };
+    expect(decisionInboxThreads([remote, question])).toEqual([question, remote]);
+  });
+
+  it("includes approval, delegated and plan decisions but not historical plans", () => {
+    const idle = presentThreadShell(environmentId, {
+      ...v2ThreadShell,
+      pendingRuntimeRequest: null,
+    });
+    for (const decision of [
+      { ...idle, hasPendingApprovals: true },
+      { ...idle, pendingSubagentRequest: "approval" as const },
+      { ...idle, pendingSubagentRequest: "user_input" as const },
+      { ...idle, interactionMode: "plan" as const, hasActionableProposedPlan: true },
+    ]) {
+      expect(decisionInboxThreads([decision])).toEqual([decision]);
+    }
+    expect(
+      decisionInboxThreads([
+        { ...idle, interactionMode: "default", hasActionableProposedPlan: true },
+      ]),
+    ).toEqual([]);
   });
 });
