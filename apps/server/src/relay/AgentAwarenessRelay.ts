@@ -551,11 +551,12 @@ export const make = Effect.gen(function* () {
     }
 
     // Confirm tombstones over live state to avoid removing active cards.
-    // Confirm first-state completion because sessions briefly project completed before their first turn.
+    // Confirm completion: a run can end moments before its continuation starts, and the relay
+    // alerts on every move into completed.
     const requiresConfirmation =
       (snapshot.state === null &&
         publishedStateByThread.get(threadId) !== agentAwarenessPublishIdentity(null)) ||
-      (snapshot.state?.phase === "completed" && !publishedStateByThread.has(threadId));
+      snapshot.state?.phase === "completed";
     if (requiresConfirmation) {
       const nowMs = (yield* DateTime.now).epochMilliseconds;
       const deadline = publishConfirmDeadlines.get(threadId);

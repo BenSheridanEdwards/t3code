@@ -392,6 +392,8 @@ describe("AgentAwarenessRelay", () => {
         const terminal = shell({ status });
         yield* Ref.set(currentShell, terminal);
         yield* relay.publishThread(THREAD_ID);
+        yield* TestClock.adjust("5 seconds");
+        yield* relay.drain;
         assert.equal(publications[1]?.state?.phase, status);
 
         const now = yield* DateTime.now;
@@ -417,6 +419,33 @@ describe("AgentAwarenessRelay", () => {
         assert.equal(publications.length, 3);
         assert.equal(publications[2]?.state, null);
       }).pipe(Effect.scoped),
+  );
+
+  it.effect("holds a completion through a continuation gap, then publishes it once", () =>
+    Effect.gen(function* () {
+      const { relay, currentShell, publications } = yield* makeTestRelay();
+      yield* relay.publishThread(THREAD_ID);
+      yield* Ref.set(currentShell, shell({ status: "completed" }));
+      yield* relay.publishThread(THREAD_ID);
+      yield* Ref.set(currentShell, shell());
+      yield* relay.publishThread(THREAD_ID);
+      yield* TestClock.adjust("5 seconds");
+      yield* relay.drain;
+      assert.deepEqual(
+        publications.map((publication) => publication.state?.phase),
+        ["running"],
+      );
+
+      yield* Ref.set(currentShell, shell({ status: "completed" }));
+      yield* relay.publishThread(THREAD_ID);
+      assert.equal(publications.length, 1);
+      yield* TestClock.adjust("5 seconds");
+      yield* relay.drain;
+      assert.deepEqual(
+        publications.map((publication) => publication.state?.phase),
+        ["running", "completed"],
+      );
+    }),
   );
 
   it.effect("keeps settled live work until its awaited monitor finishes", () =>
@@ -595,6 +624,8 @@ describe("AgentAwarenessRelay", () => {
       yield* deliver(
         itemEvent("event:held-item:end", item("item:tool", { ...background, status: "completed" })),
       );
+      yield* TestClock.adjust("5 seconds");
+      yield* relay.drain;
       assert.deepEqual(
         publications.map((publication) => publication.state?.phase),
         ["running", "completed"],
