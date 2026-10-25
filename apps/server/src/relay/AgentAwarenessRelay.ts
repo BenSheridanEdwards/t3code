@@ -607,8 +607,8 @@ export const make = Effect.gen(function* () {
       }
     } else {
       publishConfirmDeadlines.delete(threadId);
+      heldCompletions.delete(threadId);
     }
-    heldCompletions.delete(threadId);
 
     if (snapshot.reason === "thread-not-found") {
       yield* Effect.logDebug("publishing agent activity tombstone; thread not found", {
@@ -629,6 +629,7 @@ export const make = Effect.gen(function* () {
       reason: snapshot.reason,
     }).pipe(withRelayClientTracing);
     publishConfirmDeadlines.delete(threadId);
+    heldCompletions.delete(threadId);
     yield* Ref.update(publishedStateByThreadRef, (publishedStates) => {
       const nextPublishedStates = new Map(publishedStates);
       if (snapshot.state === null) {
