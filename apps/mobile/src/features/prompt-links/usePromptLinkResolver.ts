@@ -11,7 +11,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   parseNewThreadLink,
   type LinkedPrompt,
@@ -63,6 +63,9 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
   const loadPullRequest = useAtomQueryRunner(composerPullRequests.detail, {
     reportFailure: false,
   });
+  const loadLinkedThreads = useAtomQueryRunner(composerPullRequests.linkedThreads, {
+    reportFailure: false,
+  });
   const search = promptLinkSearchFromParams(params);
   // Wait for cold-launch shells or existing repositories may be offered for cloning.
   const waitingForShells =
@@ -89,7 +92,45 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
     return resolved?.exact !== true;
   };
 
+  const openThread = (
+    thread: { readonly environmentId: EnvironmentId; readonly id: ThreadId },
+    prompt: LinkedDraftRequest["prompt"],
+  ) => {
+    (navigation.getParent() ?? navigation).dispatch(
+      StackActions.replace("Thread", {
+        environmentId: String(thread.environmentId),
+        threadId: String(thread.id),
+      }),
+    );
+    if (prompt) {
+      void applyLinkedPromptToThreadDraft(
+        scopedThreadKey(thread.environmentId, thread.id),
+        prompt,
+        promptLinkNotice({ hiddenCharacters: prompt.hiddenCharacters }),
+      );
+    }
+  };
+
   const openProjectDraft = async (project: EnvironmentProject, request: LinkedDraftRequest) => {
+    if (request.pullRequest) {
+      // The pull request's thread can be an older settled thread the shell left out.
+      const linked = await loadLinkedThreads({
+        environmentId: project.environmentId,
+        input: {
+          projectId: project.id,
+          repository: promptLinkRepositoryName(request.pullRequest),
+          number: request.pullRequest.number,
+        },
+      });
+      const thread =
+        linked._tag === "Success"
+          ? linked.value.threads.find((candidate) => candidate.archivedAt === null)
+          : undefined;
+      if (thread) {
+        openThread({ environmentId: project.environmentId, id: thread.id }, request.prompt);
+        return;
+      }
+    }
     try {
       await waitForComposerDraftsLoaded();
     } catch {
@@ -234,19 +275,7 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
     if (link.kind === "pull-request") {
       const thread = findPromptLinkPullRequestThread(threads, link.pullRequest);
       if (thread) {
-        (navigation.getParent() ?? navigation).dispatch(
-          StackActions.replace("Thread", {
-            environmentId: String(thread.environmentId),
-            threadId: String(thread.id),
-          }),
-        );
-        if (link.prompt) {
-          void applyLinkedPromptToThreadDraft(
-            scopedThreadKey(thread.environmentId, thread.id),
-            link.prompt,
-            promptLinkNotice({ hiddenCharacters: link.prompt.hiddenCharacters }),
-          );
-        }
+        openThread(thread, link.prompt);
         return;
       }
     }

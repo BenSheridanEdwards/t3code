@@ -30,6 +30,8 @@ import { useEnvironments, usePrimaryEnvironmentId } from "~/state/environments";
 import { environmentPresentations } from "~/state/presentation";
 import { allReachableShellsLiveAtom } from "~/state/shell";
 import { sourceControlEnvironment } from "~/state/sourceControl";
+import { pullRequestEnvironment } from "~/state/pullRequests";
+import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
 
 import { usePullRequestHandoffs } from "../pullRequest/usePullRequestActions";
@@ -52,7 +54,10 @@ type LinkState =
     };
 
 type LinkLaunch =
-  | { readonly kind: "thread"; readonly thread: ReturnType<typeof useThreadShells>[number] }
+  | {
+      readonly kind: "thread";
+      readonly thread: Pick<ReturnType<typeof useThreadShells>[number], "environmentId" | "id">;
+    }
   | { readonly kind: "draft"; readonly project: EnvironmentProject }
   | { readonly kind: "scratch" }
   | { readonly kind: "settled" };
@@ -218,12 +223,38 @@ export function NewThreadLinkView({ link }: { readonly link: NewThreadLink }) {
     await openDraft(project);
   };
 
-  if (ready && state.status === "opening" && !started) {
+  // A pull request's thread can be an older settled thread the shell left out; the server knows.
+  const localPullRequestThread =
+    ready && link.kind === "pull-request"
+      ? findPromptLinkPullRequestThread(threads, link.pullRequest)
+      : undefined;
+  const pullRequestProject =
+    ready && link.kind === "pull-request" && localPullRequestThread === undefined
+      ? findPromptLinkProject(recentProjects(), link.pullRequest)
+      : undefined;
+  const linkedThreads = useEnvironmentQuery(
+    pullRequestProject === undefined || link.kind !== "pull-request"
+      ? null
+      : pullRequestEnvironment.linkedThreads({
+          environmentId: pullRequestProject.environmentId,
+          input: {
+            projectId: pullRequestProject.id,
+            repository: `${link.pullRequest.owner}/${link.pullRequest.name}`,
+            number: link.pullRequest.number,
+          },
+        }),
+  );
+  const linkedThread = linkedThreads.data?.threads.find((thread) => thread.archivedAt === null);
+  const linkedThreadsDone =
+    pullRequestProject === undefined || linkedThreads.data !== null || linkedThreads.error !== null;
+
+  if (ready && linkedThreadsDone && state.status === "opening" && !started) {
     setStarted(true);
     const pullRequestThread =
-      link.kind === "pull-request"
-        ? findPromptLinkPullRequestThread(threads, link.pullRequest)
-        : undefined;
+      localPullRequestThread ??
+      (linkedThread === undefined || pullRequestProject === undefined
+        ? undefined
+        : { environmentId: pullRequestProject.environmentId, id: linkedThread.id });
     const repository = link.kind === "new" ? link.repository : link.pullRequest;
     const project =
       repository === null ? undefined : findPromptLinkProject(recentProjects(), repository);
