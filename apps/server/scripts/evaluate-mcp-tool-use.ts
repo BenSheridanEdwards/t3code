@@ -1282,6 +1282,14 @@ const callModel = (apiKey: string, body: unknown, proxy?: Config["proxy"]) =>
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(ApiResponse))),
   );
 
+/** A tool call as graded. Claude Code runs an `Agent` in the background unless told otherwise. */
+const recordedCall = (step: number, use: typeof ToolUse.Type): Call => {
+  const tool = normalizeToolName(use.name);
+  const input = normalizeToolInput(use.name, use.input);
+  const claudeAgent = tool === "Agent" && !use.name.endsWith("spawn_agent") && isRecord(input);
+  return { step, tool, input: claudeAgent ? { run_in_background: true, ...input } : input };
+};
+
 /**
  * Runs one sample until the model ends its turn, uses up its steps, or fails a check that no
  * later step can undo.
@@ -1313,13 +1321,7 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
     messages.push({ role: "assistant", content: response.content });
     said.push(...response.content.filter(isText).map((block) => block.text));
     const uses = response.content.filter(isToolUse);
-    calls.push(
-      ...uses.map((use) => ({
-        step,
-        tool: normalizeToolName(use.name),
-        input: normalizeToolInput(use.name, use.input),
-      })),
-    );
+    calls.push(...uses.map((use) => recordedCall(step, use)));
     if (response.stop_reason !== "tool_use") {
       stopReason = response.stop_reason ?? "unknown";
       break;
@@ -1481,7 +1483,7 @@ const Flags = Schema.Struct({
   case: Schema.optional(Schema.Array(Schema.String)),
   samples: Schema.optional(PositiveInt),
   concurrency: PositiveInt,
-  "max-steps": PositiveInt,
+  "max-steps": Schema.optional(PositiveInt),
   effort: Schema.optional(Schema.Literals(EFFORTS)),
   "shell-model": Schema.Literals(Object.keys(PRICES) as Array<PricedModel>),
   "user-instructions": Schema.Literals(["keep", "drop"]),
@@ -1511,7 +1513,8 @@ const main = Effect.gen(function* () {
       // Unset: 2 samples per case, and a 3rd when those 2 disagree.
       samples: string,
       concurrency: { ...string, default: "4" },
-      "max-steps": { ...string, default: "6" },
+      // Unset: 6 for Claude, 10 for Sol, whose code-mode cells take more steps.
+      "max-steps": string,
       effort: string,
       "shell-model": { ...string, default: "claude-haiku-5-5" },
       // T3's text must work for every user, so the captured CLAUDE.md is dropped by default.
@@ -1591,7 +1594,7 @@ const main = Effect.gen(function* () {
     model: flags.model,
     ...(flags.model === SOL ? { proxy: proxyConfig() } : {}),
     effort,
-    maxSteps: flags["max-steps"],
+    maxSteps: flags["max-steps"] ?? (flags.model === SOL ? 10 : 6),
     shellModel: flags["shell-model"],
   };
   const previous =
