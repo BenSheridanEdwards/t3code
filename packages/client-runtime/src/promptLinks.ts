@@ -61,8 +61,7 @@ export function findPromptLinkPullRequestThread<
 
 /**
  * The first open thread from per-environment pull request lookups, in the order given. `null`
- * when none has one; `undefined` while any answer is not fresh, as a cached one can predate the
- * thread.
+ * when none has one; `undefined` until every lookup has answered.
  */
 export function pickPromptLinkPullRequestThread(
   lookups: ReadonlyArray<{

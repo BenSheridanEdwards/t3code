@@ -84,7 +84,7 @@ const pullRequestThreadLookupAtom = Atom.family((key: string) => {
         .map(([environmentId, projectId]) => ({
           environmentId,
           result: get(
-            pullRequestEnvironment.linkedThreads({
+            pullRequestEnvironment.linkedThreadsUncached({
               environmentId,
               input: { projectId, repository, number },
             }),

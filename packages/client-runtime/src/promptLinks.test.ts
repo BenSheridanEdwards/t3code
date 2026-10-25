@@ -58,7 +58,7 @@ describe("pickPromptLinkPullRequestThread", () => {
       pickPromptLinkPullRequestThread(
         results.map((result, index) => ({ environmentId: index === 0 ? laptop : server, result })),
       );
-    // A cached answer shows while it refetches; the thread may be newer than it.
+    // A value shown while it refetches is not an answer yet.
     expect(pick(AsyncResult.success(none, { waiting: true }))).toBeUndefined();
     expect(pick(AsyncResult.success(none), AsyncResult.initial(true))).toBeUndefined();
     expect(pick(AsyncResult.success(none), AsyncResult.success(linked("old")))).toEqual({

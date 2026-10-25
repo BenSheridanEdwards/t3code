@@ -63,7 +63,7 @@ export function usePromptLinkResolver(params: Readonly<Record<string, unknown>> 
   const loadPullRequest = useAtomQueryRunner(composerPullRequests.detail, {
     reportFailure: false,
   });
-  const loadLinkedThreads = useAtomQueryRunner(composerPullRequests.linkedThreads, {
+  const loadLinkedThreads = useAtomQueryRunner(composerPullRequests.linkedThreadsUncached, {
     reportFailure: false,
   });
   const search = promptLinkSearchFromParams(params);
