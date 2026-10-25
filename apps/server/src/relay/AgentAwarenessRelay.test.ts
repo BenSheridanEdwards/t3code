@@ -448,6 +448,36 @@ describe("AgentAwarenessRelay", () => {
     }),
   );
 
+  it.effect("still publishes a completion when the thread settles during the hold", () =>
+    Effect.gen(function* () {
+      const { relay, currentShell, publications } = yield* makeTestRelay();
+      yield* relay.publishThread(THREAD_ID);
+      const completed = shell({ status: "completed" });
+      yield* Ref.set(currentShell, completed);
+      yield* relay.publishThread(THREAD_ID);
+      yield* Ref.set(currentShell, {
+        ...completed,
+        settledOverride: "settled",
+        settledAt: yield* DateTime.now,
+        lastVisitedAt: null,
+      });
+      yield* relay.publishThread(THREAD_ID);
+      yield* TestClock.adjust("5 seconds");
+      yield* relay.drain;
+      assert.deepEqual(
+        publications.map((publication) => publication.state?.phase ?? null),
+        ["running", "completed"],
+      );
+
+      yield* TestClock.adjust("5 seconds");
+      yield* relay.drain;
+      assert.deepEqual(
+        publications.map((publication) => publication.state?.phase ?? null),
+        ["running", "completed", null],
+      );
+    }),
+  );
+
   it.effect("keeps settled live work until its awaited monitor finishes", () =>
     Effect.gen(function* () {
       const { relay, currentShell, publications } = yield* makeTestRelay();

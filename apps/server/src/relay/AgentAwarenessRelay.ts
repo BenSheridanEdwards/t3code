@@ -411,6 +411,11 @@ export const make = Effect.gen(function* () {
 
   // Confirm through the same worker so tombstones cannot race live updates; recovery clears the deadline.
   const publishConfirmDeadlines = new Map<ThreadId, number>();
+  // The completion a confirmation holds, so a thread that settles during the hold still alerts.
+  const heldCompletions = new Map<
+    ThreadId,
+    ReturnType<typeof resolveAgentAwarenessRelayPublishSnapshot>
+  >();
   let schedulePublishConfirm: (threadId: ThreadId) => Effect.Effect<void> = () => Effect.void;
   const publishRetries = new Map<
     ThreadId,
@@ -542,6 +547,7 @@ export const make = Effect.gen(function* () {
     if (publishedStateByThread.get(threadId) === publishIdentity) {
       // Clear moot deadlines so later transient nulls cannot skip their deferral window.
       publishConfirmDeadlines.delete(threadId);
+      heldCompletions.delete(threadId);
       yield* Effect.logDebug("agent activity publish skipped; projected state unchanged", {
         environmentId,
         threadId,
@@ -558,6 +564,7 @@ export const make = Effect.gen(function* () {
         publishedStateByThread.get(threadId) !== agentAwarenessPublishIdentity(null)) ||
       snapshot.state?.phase === "completed";
     if (requiresConfirmation) {
+      if (snapshot.state?.phase === "completed") heldCompletions.set(threadId, snapshot);
       const nowMs = (yield* DateTime.now).epochMilliseconds;
       const deadline = publishConfirmDeadlines.get(threadId);
       if (deadline === undefined) {
@@ -582,9 +589,26 @@ export const make = Effect.gen(function* () {
         statePhase: snapshot.state?.phase ?? null,
         shell: describeThreadShellForAwareness(thread),
       });
+      const held = heldCompletions.get(threadId);
+      // Settled during the hold, not resumed: alert the completion, then clear the card on a new window.
+      if (snapshot.state === null && snapshot.reason === "snapshot" && held?.state != null) {
+        yield* publishState({
+          projectId: held.projectId,
+          state: held.state,
+          reason: held.reason,
+        }).pipe(withRelayClientTracing);
+        heldCompletions.delete(threadId);
+        publishConfirmDeadlines.set(threadId, nowMs + 5_000);
+        yield* Ref.update(publishedStateByThreadRef, (publishedStates) =>
+          new Map(publishedStates).set(threadId, agentAwarenessPublishIdentity(held.state)),
+        );
+        yield* schedulePublishConfirm(threadId);
+        return;
+      }
     } else {
       publishConfirmDeadlines.delete(threadId);
     }
+    heldCompletions.delete(threadId);
 
     if (snapshot.reason === "thread-not-found") {
       yield* Effect.logDebug("publishing agent activity tombstone; thread not found", {
