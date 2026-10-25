@@ -675,9 +675,18 @@ const codexModel = (id: string) => ({ id, options: [{ id: "reasoningEffort", val
 const DEFAULT_CAPABILITIES = {
   inheritedProviderInstanceId: "claudeAgent",
   inheritedModel: MODEL,
+  // Mirrors the real catalog's main models, so a case's named model is not missing by accident.
   providers: [
-    { providerInstanceId: "claudeAgent", models: ["claude-opus-5-5", MODEL].map(claudeModel) },
-    { providerInstanceId: "codex", models: ["gpt-6-astra", "gpt-6.1-sol"].map(codexModel) },
+    {
+      providerInstanceId: "claudeAgent",
+      models: ["claude-opus-5-5", MODEL, "claude-fable-5-1", "claude-haiku-5-5"].map(claudeModel),
+    },
+    {
+      providerInstanceId: "codex",
+      models: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"].map(codexModel),
+    },
+    { providerInstanceId: "muse", models: ["muse-wonder-full", "muse-wonder"].map(codexModel) },
+    { providerInstanceId: "grok", models: ["grok-4.7"].map(codexModel) },
   ],
 };
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
