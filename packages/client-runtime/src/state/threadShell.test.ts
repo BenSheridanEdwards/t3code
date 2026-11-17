@@ -194,7 +194,7 @@ describe("v2 thread shell lists", () => {
 
     snapshot = applyShellStreamEvent(snapshot, {
       kind: "thread.updated",
-      location: "archived",
+      location: "archive",
       sequence: 2,
       thread: { ...root, archivedAt: v2Now },
     });
