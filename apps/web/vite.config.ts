@@ -106,7 +106,11 @@ const browserTestProject = {
     browser: {
       enabled: true,
       headless: true,
-      provider: playwright(),
+      provider: playwright({
+        launchOptions: {
+          executablePath: process.env.T3CODE_TEST_BROWSER_PATH,
+        },
+      }),
       instances: [{ browser: "chromium" }],
       screenshotFailures: false,
       commands: {
