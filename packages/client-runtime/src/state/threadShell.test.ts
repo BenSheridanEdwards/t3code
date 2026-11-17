@@ -152,6 +152,72 @@ describe("v2 thread shell lists", () => {
     registry.dispose();
   });
 
+  it("keeps a delegated decision until a live shell update resolves the question", () => {
+    const { registry, threads, snapshotAtom } = makeHarness();
+    const root = v2ThreadShell;
+    const child = {
+      ...root,
+      id: ThreadId.make("decision-child"),
+      creationSource: "mcp" as const,
+      status: "running" as const,
+      activityRunStatus: "running" as const,
+      lineage: {
+        ...root.lineage,
+        parentThreadId: root.id,
+        relationshipToParent: "subagent" as const,
+      },
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make("decision-question"),
+        kind: "user_input" as const,
+        createdAt: v2Now,
+      },
+    };
+    let snapshot: OrchestrationV2ShellSnapshot = { ...v2ShellSnapshot, threads: [root, child] };
+    registry.set(snapshotAtom(environmentId), snapshot);
+    const dispose = registry.mount(threads.decisionInboxThreadsAtom);
+    expect(registry.get(threads.decisionInboxThreadsAtom).length).toBeGreaterThan(0);
+
+    const completedChild = { ...child, status: "completed" as const, activityRunStatus: null };
+    snapshot = applyShellStreamEvent(snapshot, {
+      kind: "thread.updated",
+      location: "active",
+      sequence: 1,
+      thread: completedChild,
+    });
+    registry.set(snapshotAtom(environmentId), snapshot);
+    expect(
+      registry.get(threads.decisionInboxThreadsAtom).map(({ id, environmentId }) => ({
+        id,
+        environmentId,
+      })),
+    ).toEqual([{ id: child.id, environmentId }]);
+
+    snapshot = applyShellStreamEvent(snapshot, {
+      kind: "thread.updated",
+      location: "archived",
+      sequence: 2,
+      thread: { ...root, archivedAt: v2Now },
+    });
+    registry.set(snapshotAtom(environmentId), snapshot);
+    expect(registry.get(threads.navigationThreadShellsAtom)).toEqual([]);
+    expect(registry.get(threads.decisionInboxThreadsAtom).map((thread) => thread.id)).toEqual([
+      child.id,
+    ]);
+
+    registry.set(
+      snapshotAtom(environmentId),
+      applyShellStreamEvent(snapshot, {
+        kind: "thread.updated",
+        location: "active",
+        sequence: 3,
+        thread: { ...completedChild, pendingRuntimeRequest: null },
+      }),
+    );
+    expect(registry.get(threads.decisionInboxThreadsAtom)).toEqual([]);
+    dispose();
+    registry.dispose();
+  });
+
   it("brings a parent back from Working while a nested subagent waits for approval", () => {
     const { registry, threads, snapshotAtom } = makeHarness();
     const child = {

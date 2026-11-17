@@ -12,6 +12,7 @@ import { Atom } from "effect/reactivity";
 
 import type { EnvironmentThreadShell, PendingSubagentRequest } from "./models.ts";
 import { presentThreadShell, threadRuntimeIsActive } from "./models.ts";
+import { decisionInboxThreads } from "./threadInbox.ts";
 import { type EnvironmentCatalogState, enabledEnvironmentIds } from "./connections.ts";
 import {
   arrayElementsEqual,
@@ -402,6 +403,10 @@ export function createEnvironmentThreadShellAtoms(input: {
     return next;
   }).pipe(Atom.withLabel("environment-quiet-thread-shell-list"));
 
+  const decisionInboxThreadsAtom = Atom.make((get) =>
+    decisionInboxThreads(get(quietThreadShellsAtom)),
+  ).pipe(Atom.withLabel("environment-decision-inbox-threads"));
+
   let previousNavigationShells: ReadonlyArray<EnvironmentThreadShell> = [];
   const navigationThreadShellsAtom = Atom.make((get) => {
     const next: EnvironmentThreadShell[] = [];
@@ -426,6 +431,7 @@ export function createEnvironmentThreadShellAtoms(input: {
     threadRefsAtom,
     threadShellsAtom,
     quietThreadShellsAtom,
+    decisionInboxThreadsAtom,
     navigationThreadShellsAtom,
     threadShellsForProjectRefsAtom: (refs: ReadonlyArray<ScopedProjectRef>) =>
       threadShellsForProjectRefsAtomFamily(projectRefCollectionKey(refs)),

@@ -93,6 +93,7 @@ import { ThreadListFilters } from "./ThreadListFilters";
 interface HomeScreenProps {
   readonly projects: ReadonlyArray<EnvironmentProject>;
   readonly threads: ReadonlyArray<EnvironmentThreadShell>;
+  readonly decisionThreads: ReadonlyArray<EnvironmentThreadShell>;
   readonly pendingTasks: ReadonlyArray<PendingNewTask>;
   readonly catalogState: WorkspaceState;
   readonly savedConnectionsById: Readonly<Record<string, SavedRemoteConnection>>;
@@ -659,7 +660,9 @@ export function HomeScreen(props: HomeScreenProps) {
   };
 
   const hasAnyThreads =
-    props.threads.some((thread) => thread.archivedAt === null) || props.pendingTasks.length > 0;
+    props.threads.some((thread) => thread.archivedAt === null) ||
+    props.decisionThreads.length > 0 ||
+    props.pendingTasks.length > 0;
   const selectedEnvironmentLabel =
     props.selectedEnvironmentId === null
       ? null
@@ -722,7 +725,7 @@ export function HomeScreen(props: HomeScreenProps) {
     <>
       {listHeader}
       <DecisionInbox
-        threads={props.threads}
+        threads={props.decisionThreads}
         projects={props.projects}
         environments={props.environments}
         onSelectThread={props.onSelectThread}
