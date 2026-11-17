@@ -130,6 +130,14 @@ the pinned section. Each device keeps its own choice.
 While this is on, the active list is ordered by when each thread last came back to you, so you
 cannot drag or move threads within it. Your saved order returns when you turn it off.
 
+## Find outstanding decisions
+
+Open **Needs your decision** above the thread list to find unanswered questions, approval
+requests and plans awaiting review across projects. Questions remain listed while an agent
+continues working. Select a thread to read the context and use its existing response controls;
+opening a thread does not answer the request. Resolved requests leave this view automatically.
+Archived and deleted threads are excluded.
+
 ## Settle finished work
 
 Choose **Settle thread** from its menu to move finished work out of the active list

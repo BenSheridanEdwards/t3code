@@ -53,6 +53,10 @@ export function HomeRouteScreen() {
     environmentThreadShells.navigationThreadShellsAtom,
     visible,
   );
+  const decisionThreads = useAtomValueWhileVisible(
+    environmentThreadShells.decisionInboxThreadsAtom,
+    visible,
+  );
   const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
   const { savedConnectionsById } = useSavedRemoteConnections();
   const navigation = useNavigation();
@@ -248,6 +252,7 @@ export function HomeRouteScreen() {
 
         <HomeScreen
           catalogState={catalogState}
+          decisionThreads={decisionThreads}
           environments={environments}
           onAddConnection={() => openSettings(navigation, "SettingsEnvironmentNew")}
           onArchiveThread={archiveThread}
